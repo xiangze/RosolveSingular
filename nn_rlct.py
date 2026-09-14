@@ -14,14 +14,19 @@ nn_rlct.py
 ------------------------------------------------------------------
 * fiber ideal
     I = < f(x_i; theta) - f(x_i; theta*) >_i
-  に対し K = sum_i g_i^2 とすると、lambda = RLCT_0(K)。RLCT はイデアルの不変量なので、生成元を単元倍したり、イデアルとして等価な変形をしてよい。
+  に対し K = sum_i g_i^2 とすると、lambda = RLCT_0(K)。RLCT はイデアルの
+  不変量なので、生成元を単元倍したり、イデアルとして等価な変形をしてよい。
 
 * セルの固定 (i)
-  ReLU ネットは theta について区分多項式。データ点 x_i とユニット j の 符号 sign(a_j . x_i + b_j) を theta* で固定すると、そのセルの上では
-  出力は theta の多項式になる。theta* がセルの内部 (すべての前活性化が非零) なら、theta* の近傍はそのセルに含まれるので、通常の (領域制限のない) 局所 RLCT の計算になり厳密。
+  ReLU ネットは theta について区分多項式。データ点 x_i とユニット j の
+  符号 sign(a_j . x_i + b_j) を theta* で固定すると、そのセルの上では
+  出力は theta の多項式になる。theta* がセルの内部 (すべての前活性化が
+  非零) なら、theta* の近傍はそのセルに含まれるので、通常の (領域制限の
+  ない) 局所 RLCT の計算になり厳密。
   theta* がセルの境界にある場合は、近傍が複数のセルに分かれるので
       lambda_true = min over 接するセル (錐に制限した RLCT)
-  であり、錐への制限は積分領域を狭めるので lambda を下げない。すなわち本コードが返す「制限なしの値」は lambda_true の下界になる。
+  であり、錐への制限は積分領域を狭めるので lambda を下げない。すなわち
+  本コードが返す「制限なしの値」は lambda_true の下界になる。
 
 * 連続対称性の商 (ii)
   群 G が theta* の近傍に自由に作用し K が G 不変なら、局所座標を
@@ -138,6 +143,20 @@ class LocalRLCT:
         print(self.report())
         if with_history and self.resolution is not None:
             print(self.resolution.report(only_minimal=True))
+
+    # --- Graphviz (コアイデアルの解消過程) ---------------------------
+    def to_dot(self, **kw) -> str:
+        """コアイデアルの解消の場合分けを DOT 形式で返す。"""
+        if self.resolution is None:
+            raise ValueError("コアイデアルが空なので解消の木はありません "
+                             "(lambda は正則方向だけで決まっています)。")
+        return self.resolution.to_dot(**kw)
+
+    def render_tree(self, path: str = "core_resolution", fmt: str = "png", **kw):
+        """コアイデアルの解消過程を Graphviz で描画する。"""
+        if self.resolution is None:
+            raise ValueError("コアイデアルが空なので解消の木はありません。")
+        return self.resolution.render_tree(path=path, fmt=fmt, **kw)
 
 
 # ----------------------------------------------------------------------

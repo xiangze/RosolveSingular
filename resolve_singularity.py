@@ -92,6 +92,24 @@ m はそれを達成する chart 上の最大値)。本プログラムは各 cha
    いずれも ResolutionFailure(reason=...) を送出する。
 
 ------------------------------------------------------------------
+重み付きブローアップ (weighted=True)
+------------------------------------------------------------------
+中心の各方向に重み w_j > 0 を付けて
+
+    x_i = s * y_i^{w_i},   x_j = y_i^{w_j} * y_j   (j in J, j != i)
+
+とする。単項式の指数は e_i' = sum_{j in J} w_j e_j に移り、ヤコビアンは
+w_i * y_i^{(sum_{j in J} w_j) - 1}。重みはニュートン多面体のファセット法線
+(Newton 距離を決めるファセット、LP の双対変数) から取り、f_rest がその重みに
+ついて擬斉次なときだけ使う (そうでないと反復が増えて逆効果)。
+
+これで擬斉次な孤立特異点が 1 回で単項式化できる。例えば x^3+y^4+z^5 は
+w = (20,15,12) で f = x^60 (1 + y^4 + z^5) となり、通常のブローアップでは
+何回反復しても止まらないのに 5 chart で終わる (lambda = 47/60)。
+w_i が偶数の chart は y_i -> y_i^{w_i} が実数体で負の側を覆えないので、
+符号 s = +-1 の 2 chart に分ける。
+
+------------------------------------------------------------------
 分枝限定 (prune=True / 'ties')
 ------------------------------------------------------------------
 lambda は「全 chart の最小値」なので、最小化問題として分枝限定が使える。
@@ -125,6 +143,26 @@ RLCT だけが欲しい場合は不要な部分木を捨てられる。
 
 * 中心の選択 (最小ヒッティング集合) も 0-1 整数計画として pulp に投げる
   (変数や単項式が多い場合)。内部の分枝限定はフォールバック。
+
+------------------------------------------------------------------
+Graphviz による可視化
+------------------------------------------------------------------
+探索した chart はすべて記録され (keep_tree=True)、
+
+    res = resolve_singularities(f, gens)
+    res.render_tree("tree", "png")     # 画像を書き出す
+    print(res.to_dot())                # DOT 形式の文字列
+
+で場合分けの木を描ける。各ノードには
+  * ブローアップの中心 {x_j = 0 : j in J} と、どの chart か (x_i = y_i)
+  * ブローアップ直後の式 (正規化前)
+  * 正規化で括り出した単項式と、その後の式
+  * その時点の指数ベクトル k, h
+  * 解消済みなら lambda と位数、枝刈りならその下界と上界
+が書き込まれる。色は 解消済み=緑 / 枝刈り=灰 / 未解消=赤 / 座標変換=青
+/ 中心の付け替え=橙。lambda の最小値を与える chart は赤枠で強調される。
+ResolutionFailure にも途中までの木が入っているので e.render_tree() で
+どこで詰まったかを見られる。
 
 ------------------------------------------------------------------
 注意 (limitation)
@@ -287,6 +325,8 @@ def _ilp_min_hitting_set(supports: Sequence[frozenset], n: int,
 
 __all__ = [
     "ResolutionFailure",
+    "charts_to_dot",
+    "render_charts",
     "Chart",
     "Resolution",
     "resolve_singularities",
@@ -301,12 +341,20 @@ class ResolutionFailure(Exception):
     """一定回数の反復では特異点を解消できなかった場合に送出される。"""
 
     def __init__(self, message: str, *, chart: "Chart" = None, reason: str = "",
-                 bound=None, lower=None):
+                 bound=None, lower=None, nodes=None):
         super().__init__(message)
         self.chart = chart
         self.reason = reason
         self.bound = bound   # 分枝限定で得られている lambda の上界 (あれば)
         self.lower = lower   # 未解消 chart の下界 (あれば)
+        self.nodes = nodes or {}   # 途中までの chart 木 (Graphviz 描画用)
+
+    def to_dot(self, **kw) -> str:
+        """途中までの探索木を DOT 形式で返す。"""
+        return charts_to_dot(self.nodes, **kw)
+
+    def render_tree(self, path: str = "resolution_tree", fmt: str = "png", **kw):
+        return render_charts(self.nodes, path=path, fmt=fmt, **kw)
 
 
 # ----------------------------------------------------------------------
@@ -316,11 +364,14 @@ class ResolutionFailure(Exception):
 class Step:
     """1 回の式変形の記録。"""
 
-    kind: str          # 'init' | 'blowup' | 'normalize' | 'recenter'
+    kind: str          # 'init' | 'blowup' | 'normalize' | 'coordchg' | 'recenter'
     detail: str        # 人間可読な説明
     f_rest: sp.Expr    # 変形後の単元候補
     k: Tuple[int, ...]
     h: Tuple[int, ...]
+    subs: Tuple[Tuple[sp.Symbol, sp.Expr], ...] = ()   # この変形の座標置換
+    center: Tuple[sp.Symbol, ...] = ()                 # blow-up の中心 (変数の組)
+    weights: Tuple[int, ...] = ()                      # 重み付きブローアップの重み
 
     def __str__(self) -> str:
         return f"[{self.kind:<9}] {self.detail}\n            f_rest = {self.f_rest}\n            k = {self.k}, h = {self.h}"
@@ -339,6 +390,14 @@ class Chart:
     depth: int = 0
     resolved: bool = False
     seen: frozenset = frozenset()   # この系列で現れた f_rest (無限反復の検出用)
+    parent: Optional[str] = None    # 親 chart の名前 (木の描画用)
+    status: str = "internal"        # 'resolved'|'pruned'|'blowup'|'coordchg'|'recenter'|'failed'
+    entry: int = 0                  # 親から引き継いだ steps の本数 (自分の steps はこれ以降)
+    note: str = ""                  # 枝刈りの理由など (木の描画用)
+
+    def own_steps(self) -> List[Step]:
+        """この chart で行われた変形だけを取り出す。"""
+        return self.steps[self.entry:]
 
     # -- 便利メソッド ---------------------------------------------------
     @property
@@ -396,6 +455,36 @@ class Resolution:
     n_pruned: int = 0
     n_lp: int = 0
     warnings: List[str] = field(default_factory=list)
+    nodes: Dict[str, "Chart"] = field(default_factory=dict)
+
+    # --- Graphviz ---------------------------------------------------
+    def _minimal_charts(self):
+        return [c.name for c in self.charts if c.local_rlct()[0] == self.rlct]
+
+    def to_dot(self, **kw) -> str:
+        """探索木 (chart の場合分け) を DOT 形式の文字列で返す。
+
+        既定では lambda の最小値を与える chart を赤枠で強調する。
+        """
+        kw.setdefault("highlight", self._minimal_charts())
+        kw.setdefault("title", f"f = {self.f}   ->   lambda = {self.rlct},"
+                               f" m = {self.multiplicity}")
+        return charts_to_dot(self.nodes, **kw)
+
+    def to_lean(self, directory: str = "lean_out", **kw):
+        """Lean 4 の証明義務として書き出す (lean_export.py が必要)。"""
+        from lean_export import export_lean
+        return export_lean(self, directory, **kw)
+
+    def render_tree(self, path: str = "resolution_tree", fmt: str = "png", **kw):
+        """Graphviz で画像に描画する (graphviz パッケージか dot コマンドが必要)。
+
+        戻り値は生成したファイルのパス。
+        """
+        kw.setdefault("highlight", self._minimal_charts())
+        kw.setdefault("title", f"f = {self.f}   ->   lambda = {self.rlct},"
+                               f" m = {self.multiplicity}")
+        return render_charts(self.nodes, path=path, fmt=fmt, **kw)
 
     def report(self, only_minimal: bool = False) -> str:
         lines = [
@@ -506,6 +595,80 @@ def _min_center(p: sp.Poly, max_size: int = 8, backend: str = "auto") -> List[in
     return best[0]
 
 
+def _newton_weight(p: sp.Poly, backend: str = "auto") -> Optional[List[int]]:
+    """f_rest のニュートン多面体から重みベクトル w > 0 を選ぶ。
+
+    対角線が到達するファセットの法線 (= Newton 距離を決めるファセット) を
+    双対変数から取り出す。擬斉次な多項式 x^a + y^b + z^c ならちょうど
+    (1/a, 1/b, 1/c) に比例する重みが得られ、1 回の重み付きブローアップで
+    単項式化できる。どんな正整数ベクトルでも解消の正しさは保たれるので
+    (トーリック射なので固有かつ全射)、失敗したら全部 1 (通常のブローアップ)
+    に落とす。
+    """
+    n = len(p.gens)
+    monoms = [tuple(m) for m in p.monoms()]
+    if not monoms or any(all(e == 0 for e in m) for m in monoms):
+        return None
+    if not _HAS_SCIPY:
+        return None
+    N = len(monoms)
+    # max sum(nu) s.t. sum_a nu_a * a_j <= 1  -> 双対変数が重み
+    c = [-1.0] * N
+    A_ub = [[float(monoms[a][j]) for a in range(N)] for j in range(n)]
+    b_ub = [1.0] * n
+    try:
+        res = _linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=[(0, None)] * N)
+        duals = [abs(float(v)) for v in res.ineqlin.marginals]
+    except Exception:
+        return None
+    if not res.success or max(duals) <= 0:
+        return None
+    w = []
+    for d in duals:
+        r = sp.Rational(d).limit_denominator(200)
+        w.append(r if r > 0 else sp.Rational(1, 1000))
+    lcm = sp.ilcm(*[r.q for r in w]) if n > 1 else w[0].q
+    wi = [int(r * lcm) for r in w]
+    g = 0
+    for v in wi:
+        g = sp.igcd(g, v)
+    if g > 1:
+        wi = [v // g for v in wi]
+    wi = [max(1, v) for v in wi]
+    if max(wi) > 500:
+        return None
+    return wi
+
+
+def _weighted_blowup_poly(p: sp.Poly, i: int, J: Sequence[int],
+                          w: Sequence[int], sign: int) -> sp.Poly:
+    """重み付きブローアップ chart i:  x_i = sign * y_i^{w_i},
+    x_j = y_i^{w_j} * y_j (j in J, j != i)。
+
+    単項式の指数は  e_i' = sum_{j in J} w_j e_j  に移り、他は不変。
+    係数には sign^{e_i} が掛かる (sign は w_i が偶数のときだけ -1 を取る)。
+    """
+    acc: Dict[Tuple[int, ...], sp.Expr] = {}
+    for mon, c in zip(p.monoms(), p.coeffs()):
+        e = list(mon)
+        e[i] = sum(w[j] * mon[j] for j in J)
+        cc = c * (sign ** mon[i]) if sign < 0 else c
+        key = tuple(e)
+        acc[key] = acc.get(key, sp.S.Zero) + cc
+    acc = {kk: sp.simplify(vv) for kk, vv in acc.items()}
+    acc = {kk: vv for kk, vv in acc.items() if vv != 0}
+    if not acc:
+        raise ResolutionFailure("重み付きブローアップ後に f が消えました (異常)。")
+    return sp.Poly.from_dict(acc, *p.gens)
+
+
+def _weighted_pushforward(e: Sequence[int], i: int, J: Sequence[int],
+                          w: Sequence[int]) -> List[int]:
+    ne = list(e)
+    ne[i] = sum(w[j] * e[j] for j in J)
+    return ne
+
+
 def _blowup_poly(p: sp.Poly, i: int, J: Sequence[int]) -> sp.Poly:
     """chart i のブローアップ x_j -> x_i x_j (j in J, j != i)。
 
@@ -600,7 +763,9 @@ def _chart_upper_bound(k: Sequence[int], p: sp.Poly, h: Sequence[int],
 def _offorigin_centers(chart: Chart, max_solutions: int = 4):
     """例外因子 {x_e = 0} 上で f_rest が非正規交差になる点を探す。
 
-    条件: f_rest = 0 かつ (x_e 以外の) 勾配 = 0。
+    条件: f_rest = 0 かつ (x_e 以外の) 勾配 = 0。さらに、その点がもとの原点に
+    写る (phi(p) = 0) ことを確認する。例外因子でない座標超平面上の点は原点に
+    写らないので、局所 RLCT には無関係だからである。
     見つかった点の座標 dict のリストを返す (原点は除く)。
     """
     gens = chart.gens
@@ -631,6 +796,10 @@ def _offorigin_centers(chart: Chart, max_solutions: int = 4):
                     break
                 pt[v] = val
             if ok and any(pt[v] != 0 for v in others):
+                # もとの原点に写る点だけが局所 RLCT に関係する。phi(p) = 0 を確認する。
+                # (深さ 0 では phi は恒等写像なので、原点以外は自動的に除外される)
+                if not all(sp.simplify(e.subs(pt)) == 0 for e in chart.phi.values()):
+                    continue
                 if pt not in found:
                     found.append(pt)
     return found
@@ -707,7 +876,8 @@ def _smooth_factor_change(chart: Chart, name: str) -> Optional["Chart"]:
             detail = (f"滑らかな因子の座標化: {v} -> ({v} - ({B}))/({A})"
                       f"  [因子 ({g})^{d} を {v}^{d} に]")
             step = Step("coordchg", detail, new_poly.as_expr(),
-                        tuple(chart.k), tuple(chart.h))
+                        tuple(chart.k), tuple(chart.h),
+                        subs=tuple(sub.items()))
             return Chart(
                 name=name,
                 poly=new_poly,
@@ -716,6 +886,8 @@ def _smooth_factor_change(chart: Chart, name: str) -> Optional["Chart"]:
                 phi=new_phi,
                 steps=chart.steps + [step],
                 depth=chart.depth + 1,
+                parent=chart.name,
+                entry=len(chart.steps),
             )
     return None
 
@@ -731,7 +903,8 @@ def _recenter(chart: Chart, point: Dict[sp.Symbol, sp.Expr], name: str) -> Chart
     new_h = [0 if point.get(v, 0) != 0 else hj for v, hj in zip(gens, chart.h)]
     new_phi = {v: sp.expand(expr.subs(shift, simultaneous=True)) for v, expr in chart.phi.items()}
     detail = "中心の付け替え: " + ", ".join(f"{v} -> {v} + {c}" for v, c in point.items() if c != 0)
-    step = Step("recenter", detail, new_poly.as_expr(), tuple(new_k), tuple(new_h))
+    step = Step("recenter", detail, new_poly.as_expr(), tuple(new_k), tuple(new_h),
+                subs=tuple(shift.items()))
     return Chart(
         name=name,
         poly=new_poly,
@@ -740,6 +913,8 @@ def _recenter(chart: Chart, point: Dict[sp.Symbol, sp.Expr], name: str) -> Chart
         phi=new_phi,
         steps=chart.steps + [step],
         depth=chart.depth + 1,
+        parent=chart.name,
+        entry=len(chart.steps),
     )
 
 
@@ -757,8 +932,11 @@ def resolve_singularities(
     smooth_coords: bool = True,
     drop_unit_factors: bool = True,
     center: str = "min",
+    weighted: bool = False,
     prune=True,
     lp_backend: str = "auto",
+    keep_tree: bool = True,
+    max_tree_nodes: int = 3000,
     verbose: bool = False,
 ) -> Resolution:
     """多項式 f の原点における特異点をブローアップの反復で解消する。
@@ -774,6 +952,12 @@ def resolve_singularities(
         これを超えても解消できない chart があれば ResolutionFailure。
     max_charts : int
         生成する chart 数の上限 (組合せ爆発への保険)。超えたら例外。
+    weighted : bool
+        重み付きブローアップを使う。ニュートン多面体のファセット法線を
+        重み w > 0 に取り、x_i = y_i^{w_i}, x_j = y_i^{w_j} y_j とする。
+        擬斉次な特異点 (x^3+y^4+z^5 など) が 1 回で単項式化でき、通常の
+        ブローアップでは停止しない例が解けるようになる。w_i が偶数の
+        chart は実数体では負の側を覆えないので符号 2 通りに分ける。
     center : {'min', 'support'}
         ブローアップの中心の選び方。'min' は零点集合に含まれる最小の
         座標部分空間 (最小ヒッティング集合)、'support' は f_rest に現れる
@@ -792,8 +976,16 @@ def resolve_singularities(
           * 下界 LB: メディアント不等式による部分木の lambda の下界。
         を計算し、LB > (これまでの最良値と UB の最小) なら展開を打ち切る。
         lambda と位数 m は保存される (厳密に > のときだけ枝刈りするため)。
-        LB は「各ステップで括り出される order <= 現在の重複度、かつ重複度は
-        増えない」という標準的な仮定に依る。完全な網羅が必要なら False。
+        LB は「各ステップで括り出される order <= 現在の重複度、重複度は増えない、
+        かつ残り max_depth 回で解消しきる」という前提で予算を見積もっている。
+        max_depth が小さすぎると刈りすぎるが、その場合は上界との矛盾を検出して
+        ResolutionFailure(reason='prune-inconsistent') を送出する。
+        完全な網羅が必要なら False。
+    keep_tree : bool
+        走査した chart をすべて記録し、Resolution.to_dot() /
+        Resolution.render_tree() で Graphviz の木として描けるようにする。
+    max_tree_nodes : int
+        木に記録する chart 数の上限。
     lp_backend : {'auto', 'pulp', 'scipy'}
         LP/ILP のバックエンド。'pulp' は CBC などの外部ソルバーを呼ぶ。
         'auto' は探索ループ内では in-process の scipy(HiGHS)、単発の
@@ -836,6 +1028,9 @@ def resolve_singularities(
     n_created = 1
     n_pruned = 0
     n_lp = 0
+    nodes: Dict[str, Chart] = {}
+    if keep_tree:
+        nodes[root.name] = root
     ub_cache: dict = {}
     bound = float("inf")      # 大域 lambda の上界 (LP 上界 or 到達値)
     achieved = float("inf")   # 実際に解消済み chart が到達した最小値
@@ -848,6 +1043,8 @@ def resolve_singularities(
 
     while stack:
         ch = stack.pop()
+        if keep_tree and len(nodes) < max_tree_nodes:
+            nodes[ch.name] = ch
 
         # ---- 1. 正規化 (単項式因子の括り出し) ----------------------
         a, q = _monomial_content(ch.poly)
@@ -889,6 +1086,9 @@ def resolve_singularities(
                 tie = (not cut) and prune_ties and lbf >= achieved * (1 - 1e-9) - 1e-12
                 if cut or tie:
                     n_pruned += 1
+                    ch.status = "pruned"
+                    ch.note = (f"LB={lb} {'>' if cut else '>='} "
+                               f"{bound if cut else achieved:.4g}")
                     ties_pruned = ties_pruned or tie
                     if verbose:
                         print(f"  [pruned]   {ch.name}: LB={lb} "
@@ -911,9 +1111,23 @@ def resolve_singularities(
             for idx, pt in enumerate(_offorigin_centers(ch)):
                 recentered.append(_recenter(ch, pt, f"{ch.name}r{idx}"))
 
-        # ---- 3. 原点で単元 かつ 付け替え不要 -> 解消済み -----------
+        # ---- 3. 原点で単元 -> この chart は解消済み -----------------
+        # 付け替え候補があっても、原点近傍の寄与は正当なので done に入れる
+        # (入れないと lambda を過大評価する)。
+        if unit and recentered:
+            done.append(ch)
+            lam_c, m_c = ch.local_rlct()
+            if lam_c is not sp.oo:
+                achieved = min(achieved, float(lam_c))
+                bound = min(bound, float(lam_c))
+            ch.status = "resolved+recenter"
+            if verbose:
+                print(f"  [resolved] {ch.name}: lambda={lam_c}, m={m_c}"
+                      f" (+ 付け替え {len(recentered)} 件)")
+
         if unit and not recentered:
             ch.resolved = True
+            ch.status = "resolved"
             done.append(ch)
             lam_c, m_c = ch.local_rlct()
             if lam_c is not sp.oo:
@@ -943,13 +1157,15 @@ def resolve_singularities(
                 msg += (f" / 現時点で得られている評価: lambda <= {bound:.6g}"
                         f" (この chart の下界 {lb_now})")
             msg += " / max_depth を増やすか、center を変えるか、newton_rlct() で検算してください。"
+            ch.status = "failed"
             raise ResolutionFailure(msg, chart=ch, reason="max_depth",
                                     bound=(None if bound == float("inf") else bound),
-                                    lower=lb_now)
+                                    lower=lb_now, nodes=dict(nodes))
 
         # 付け替え chart を積む
         for rc in recentered:
             n_created += 1
+            ch.status = "recenter" if ch.status == "internal" else ch.status
             stack.append(rc)
         if unit:
             # 原点自身は解消済みだが、他の点のために付け替え chart のみ続行
@@ -966,8 +1182,27 @@ def resolve_singularities(
                 reason="degenerate-center",
             )
 
-        children: List[Tuple[sp.Rational, Chart]] = []
+        # 重み付きブローアップの重み (weighted=False なら全部 1 = 通常のもの)
+        w = [1] * n
+        if weighted:
+            cand = _newton_weight(ch.poly)
+            if cand and any(c != 1 for c in cand):
+                degs = {sum(c * e for c, e in zip(cand, m))
+                        for m in ch.poly.monoms()}
+                # 重み付きが効くのは f_rest が w について擬斉次なとき。
+                # そのとき 1 回で y_i^d * (横断的な部分) になる。
+                # そうでない場合に使うと逆に反復が増えて止まらなくなるので、
+                # 通常のブローアップに落とす。
+                if len(degs) == 1:
+                    w = cand
+        chart_ids = []
         for i in J:
+            # w_i が偶数だと y_i -> y_i^{w_i} は負の側を覆えないので符号 2 通り
+            for sgn in ((1,) if w[i] % 2 == 1 else (1, -1)):
+                chart_ids.append((i, sgn))
+
+        children: List[Tuple[sp.Rational, Chart]] = []
+        for i, sgn in chart_ids:
             n_created += 1
             if n_created > max_charts:
                 raise ResolutionFailure(
@@ -976,26 +1211,42 @@ def resolve_singularities(
                     chart=ch,
                     reason="max_charts",
                 )
-            new_poly = _blowup_poly(ch.poly, i, J)
-            new_k = _pushforward_exponents(ch.k, i, J)
-            new_h = _pushforward_exponents(ch.h, i, J)
-            new_h[i] += len(J) - 1  # ヤコビアン y_i^{|J|-1}
-            sub = {gens[j]: gens[i] * gens[j] for j in J if j != i}
+            new_poly = _weighted_blowup_poly(ch.poly, i, J, w, sgn)
+            if sgn < 0 and ch.k[i] % 2 == 1:
+                # x^k の側から出る符号も単元に取り込む (恒等式を厳密に保つ)
+                new_poly = sp.Poly(-new_poly.as_expr(), *gens)
+            new_k = _weighted_pushforward(ch.k, i, J, w)
+            new_h = _weighted_pushforward(ch.h, i, J, w)
+            new_h[i] += sum(w[j] for j in J) - 1   # ヤコビアン y_i^{sum w - 1}
+            sub = {gens[j]: gens[i] ** w[j] * gens[j] for j in J if j != i}
+            if w[i] != 1 or sgn < 0:
+                sub[gens[i]] = sgn * gens[i] ** w[i]
             new_phi = {v: sp.expand(e.subs(sub, simultaneous=True)) for v, e in ch.phi.items()}
+            wtxt = "" if all(w[j] == 1 for j in J) else f" 重み {[w[j] for j in J]}"
+            stxt = "" if sgn > 0 else " (符号 -)"
             detail = (
-                f"blow-up 中心 {{{', '.join(str(gens[j]) for j in J)} = 0}}, "
-                f"chart {gens[i]}: " + ", ".join(f"{gens[j]} -> {gens[i]}*{gens[j]}" for j in J if j != i)
+                f"blow-up 中心 {{{', '.join(str(gens[j]) for j in J)} = 0}}{wtxt}{stxt}, "
+                f"chart {gens[i]}: "
+                + ", ".join(f"{gens[j]} -> {gens[i]}^{w[j]}*{gens[j]}"
+                            for j in J if j != i)
+                + (f", {gens[i]} -> {'-' if sgn < 0 else ''}{gens[i]}^{w[i]}"
+                   if (w[i] != 1 or sgn < 0) else "")
             )
             child = Chart(
-                name=f"{ch.name}-{gens[i]}",
+                name=f"{ch.name}-{gens[i]}{'m' if sgn < 0 else ''}",
                 poly=new_poly,
                 k=new_k,
                 h=new_h,
                 phi=new_phi,
                 steps=ch.steps + [Step("blowup", detail, new_poly.as_expr(),
-                                       tuple(new_k), tuple(new_h))],
+                                       tuple(new_k), tuple(new_h),
+                                       subs=tuple(sub.items()),
+                                       center=tuple(gens[j] for j in J),
+                                       weights=tuple(w[j] for j in J))],
                 depth=ch.depth + 1,
                 seen=ch.seen,      # ブローアップの系列でのみ無限反復を検出
+                parent=ch.name,
+                entry=len(ch.steps),
             )
             # 見込み値 (小さいほど大域最小を早く更新できる) で並べ替える
             est = _subtree_lower_bound(new_k, new_h, 0, False)
@@ -1003,6 +1254,7 @@ def resolve_singularities(
         # DFS スタックなので、有望なものが最後に push されるよう降順で積む
         for _, child in sorted(children, key=lambda t: -t[0]):
             stack.append(child)
+        ch.status = "blowup"
         n_blowups += 1
         if verbose:
             print(f"  [blowup {n_blowups}] {ch.name} depth={ch.depth} "
@@ -1017,6 +1269,21 @@ def resolve_singularities(
             lam, mult = l, m
         elif l == lam:
             mult = max(mult, m)
+    # --- 枝刈りの整合性チェック ------------------------------------
+    # LB の予算 M は「残り max_depth 回で解消しきる」ことを前提にしている。
+    # max_depth が小さすぎると、本来なら解消できない (= 例外になるべき) 枝まで
+    # 刈ってしまい、誤った lambda を返しうる。上界 bound と矛盾したら失敗扱いにする。
+    if n_pruned and (lam is sp.oo
+                     or (bound != float("inf")
+                         and float(lam) > bound * (1 + 1e-6) + 1e-9)):
+        raise ResolutionFailure(
+            f"枝刈りの結果が上界と矛盾しています (lambda={lam}, 上界={bound})。"
+            " 下界の予算が max_depth に依存しているため、max_depth が小さすぎると"
+            " 解消できない枝まで刈ってしまいます。max_depth を増やすか"
+            " prune=False にしてください。",
+            reason="prune-inconsistent", bound=(None if bound == float("inf") else bound),
+            nodes=dict(nodes))
+
     if lam is sp.oo:
         warnings.append("f は原点で消えていません (lambda = oo)。")
 
@@ -1041,7 +1308,141 @@ def resolve_singularities(
         n_pruned=n_pruned,
         n_lp=n_lp,
         warnings=warnings,
+        nodes=nodes,
     )
+
+
+# ----------------------------------------------------------------------
+# Graphviz による chart 木の可視化
+# ----------------------------------------------------------------------
+_STATUS_STYLE = {
+    "resolved": ("#d8f0d8", "解消済み"),
+    "resolved+recenter": ("#d8f0d8", "解消済み + 付け替え"),
+    "pruned":   ("#e6e6e6", "枝刈り"),
+    "failed":   ("#f7cccc", "未解消"),
+    "blowup":   ("#ffffff", "ブローアップ"),
+    "coordchg": ("#e8e8ff", "座標変換"),
+    "recenter": ("#fff0d8", "中心の付け替え"),
+    "internal": ("#ffffff", ""),
+}
+
+
+def _esc(t: str) -> str:
+    """DOT のラベル用にエスケープする (行末は \\l で左寄せ)。"""
+    return (str(t).replace("\\", "\\\\").replace('"', '\\"')
+            .replace("{", "\\{").replace("}", "\\}")
+            .replace("<", "\\<").replace(">", "\\>")
+            .replace("|", "\\|"))
+
+
+def _short(expr, limit: int) -> str:
+    t = sp.sstr(expr)
+    if limit and len(t) > limit:
+        t = t[:limit - 3] + "..."
+    return t
+
+
+def _node_label(ch: "Chart", limit: int, show_exprs: bool) -> str:
+    """1 つの chart のラベル。ブローアップ前後・中心・正規化前後を書き込む。"""
+    L = [f"{ch.name}  (depth={ch.depth})"]
+    steps = ch.own_steps()
+    entry = next((s for s in steps
+                  if s.kind in ("blowup", "coordchg", "recenter", "init")), None)
+    norms = [s for s in steps if s.kind == "normalize"]
+
+    if entry is not None:
+        L.append(_esc(_short(entry.detail, limit)))
+        if show_exprs and entry.kind != "init":
+            tag = {"blowup": "blow-up 後", "coordchg": "座標変換後",
+                   "recenter": "平行移動後"}[entry.kind]
+            L.append(f"{tag}: {_esc(_short(entry.f_rest, limit))}")
+    for s in norms:
+        L.append(_esc(_short(s.detail, limit)))
+        if show_exprs:
+            L.append(f"正規化後: {_esc(_short(s.f_rest, limit))}")
+    if show_exprs and not steps:
+        L.append(f"f_rest: {_esc(_short(ch.f_rest(), limit))}")
+
+    L.append(f"k={tuple(ch.k)}  h={tuple(ch.h)}")
+    if ch.status == "resolved":
+        lam, m = ch.local_rlct()
+        L.append(f"単元 -> lambda={lam}, m={m}")
+    else:
+        note = _STATUS_STYLE.get(ch.status, ("", ""))[1]
+        if note:
+            L.append(f"[{note}]" + (f" {_esc(ch.note)}" if ch.note else ""))
+    return "\\l".join(L) + "\\l"
+
+
+def charts_to_dot(nodes: Dict[str, "Chart"], *, title: str = "",
+                  max_expr_len: int = 90, show_exprs: bool = True,
+                  rankdir: str = "TB", highlight=None) -> str:
+    """chart の場合分けを Graphviz の DOT 形式で書き出す。
+
+    各ノードには
+      * ブローアップの中心と chart (どの変数で割ったか)
+      * ブローアップ (あるいは座標変換・平行移動) 直後の式
+      * 正規化で括り出した単項式と、正規化後の式
+      * その時点の指数ベクトル k, h
+      * 解消済みなら lambda と位数、枝刈り/未解消ならその印
+    を書き込む。max_expr_len で式の表示長を切る (0 で無制限)。
+    """
+    lines = ["digraph resolution {",
+             f'  rankdir={rankdir};',
+             '  node [shape=box, style="rounded,filled", fontname="monospace",'
+             ' fontsize=9];',
+             '  edge [fontname="monospace", fontsize=9];']
+    if title:
+        lines.append(f'  label="{_esc(title)}"; labelloc=t; fontsize=12;')
+    if highlight is None:
+        hl = set()
+    elif isinstance(highlight, str):
+        hl = {highlight}
+    else:
+        hl = set(highlight)
+    ids = {name: f"n{i}" for i, name in enumerate(sorted(nodes))}
+    for name, ch in sorted(nodes.items()):
+        color = _STATUS_STYLE.get(ch.status, ("#ffffff", ""))[0]
+        pen = ', penwidth=3, color="#cc3333"' if name in hl else ""
+        lines.append(f'  {ids[name]} [label="{_node_label(ch, max_expr_len, show_exprs)}"'
+                     f', fillcolor="{color}"{pen}];')
+    for name, ch in sorted(nodes.items()):
+        if ch.parent and ch.parent in ids:
+            kind = next((s.kind for s in ch.own_steps()
+                         if s.kind in ("blowup", "coordchg", "recenter")), "")
+            elabel = {"blowup": name.rsplit("-", 1)[-1], "coordchg": "座標変換",
+                      "recenter": "中心付け替え"}.get(kind, "")
+            lines.append(f'  {ids[ch.parent]} -> {ids[name]}'
+                         + (f' [label="{_esc(elabel)}"];' if elabel else ";"))
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def render_charts(nodes: Dict[str, "Chart"], *, path: str = "resolution_tree",
+                  fmt: str = "png", view: bool = False, **kw):
+    """DOT を書き出し、可能なら画像に変換する。
+
+    graphviz パッケージがあればそれを使い、無ければ dot コマンドを呼ぶ。
+    どちらも無ければ .dot ファイルだけ書いてそのパスを返す。
+    """
+    import shutil
+    import subprocess
+
+    dot = charts_to_dot(nodes, **kw)
+    dot_path = path if path.endswith(".dot") else path + ".dot"
+    with open(dot_path, "w", encoding="utf-8") as fh:
+        fh.write(dot)
+    try:
+        import graphviz  # type: ignore
+        src = graphviz.Source(dot, filename=path, format=fmt)
+        return src.render(cleanup=True, view=view)
+    except Exception:
+        pass
+    if shutil.which("dot"):
+        out = (path if path.endswith("." + fmt) else path + "." + fmt)
+        subprocess.run(["dot", f"-T{fmt}", dot_path, "-o", out], check=True)
+        return out
+    return dot_path
 
 
 # ----------------------------------------------------------------------
@@ -1162,12 +1563,45 @@ def _demo():
     print("\n=== 履歴の例: f = (x*y + z^2)^2 " + "=" * 29)
     resolve_singularities((x * y + z**2) ** 2, (x, y, z)).print_report(only_minimal=True)
 
+    print("\n=== 重み付きブローアップ " + "=" * 38)
+    for label, f, g in [("x^3+y^4+z^5", x**3 + y**4 + z**5, (x, y, z)),
+                        ("x^2+y^3+z^7", x**2 + y**3 + z**7, (x, y, z))]:
+        for wt in (False, True):
+            st = time.time()
+            try:
+                r = resolve_singularities(f, g, weighted=wt, prune=False,
+                                          max_depth=20)
+                print(f"  {label:<12} weighted={str(wt):<5}: lambda={r.rlct}"
+                      f" charts={len(r.charts):<4} {time.time()-st:5.2f}s")
+            except ResolutionFailure as e:
+                print(f"  {label:<12} weighted={str(wt):<5}: "
+                      f"ResolutionFailure({e.reason}) {time.time()-st:5.2f}s")
+
+    print("\n=== Graphviz で chart の場合分けを木に描く " + "=" * 20)
+    for label, f, g, kw in [("x2_y3", x**2 + y**3, (x, y), dict(prune=False)),
+                            ("x2_y3_z4", x**2 + y**3 + z**4, (x, y, z), {})]:
+        res = resolve_singularities(f, g, **kw)
+        try:
+            out = res.render_tree(f"tree_{label}", "png")
+            print(f"  {label}: {out}  (ノード {len(res.nodes)}, "
+                  f"枝刈り {res.n_pruned})")
+        except Exception as e:            # graphviz が無い環境
+            with open(f"tree_{label}.dot", "w") as fh:
+                fh.write(res.to_dot())
+            print(f"  {label}: tree_{label}.dot を書き出しました ({e})")
+        
+
     print("\n=== 解消できない場合は例外 " + "=" * 34)
     try:
-        resolve_singularities(x**2 + y**7, (x, y), max_depth=2)
+        resolve_singularities(x**2 + y**7, (x, y), max_depth=2, prune=False)
     except ResolutionFailure as e:
         print(f"  x^2+y^7 (max_depth=2) -> ResolutionFailure(reason={e.reason!r})")
         print(f"    {str(e)[:180]}...")
+        try:
+            print(f"    途中までの木: "
+                  f"{e.render_tree('tree_failed', 'png', highlight=e.chart.name)}")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

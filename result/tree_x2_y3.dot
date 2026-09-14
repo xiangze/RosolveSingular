@@ -1,0 +1,19 @@
+digraph resolution {
+  rankdir=TB;
+  node [shape=box, style="rounded,filled", fontname="monospace", fontsize=9];
+  edge [fontname="monospace", fontsize=9];
+  label="f = x**2 + y**3   -\>   lambda = 5/6, m = 1"; labelloc=t; fontsize=12;
+  n0 [label="C0  (depth=0)\lf = x**2 + y**3\lk=(0, 0)  h=(0, 0)\l[ブローアップ]\l", fillcolor="#ffffff"];
+  n1 [label="C0-x  (depth=1)\lblow-up 中心 \{x, y = 0\}, chart x: y -\> x^1*y\lblow-up 後: x**3*y**3 + x**2\l単項式 x**2 を括り出し\l正規化後: x*y**3 + 1\lk=(2, 0)  h=(1, 0)\l単元 -> lambda=1, m=1\l", fillcolor="#d8f0d8"];
+  n2 [label="C0-y  (depth=1)\lblow-up 中心 \{x, y = 0\}, chart y: x -\> y^1*x\lblow-up 後: x**2*y**2 + y**3\l単項式 y**2 を括り出し\l正規化後: x**2 + y\lk=(0, 2)  h=(0, 1)\l[ブローアップ]\l", fillcolor="#ffffff"];
+  n3 [label="C0-y-x  (depth=2)\lblow-up 中心 \{x, y = 0\}, chart x: y -\> x^1*y\lblow-up 後: x**2 + x*y\l単項式 x を括り出し\l正規化後: x + y\lk=(3, 2)  h=(2, 1)\l[ブローアップ]\l", fillcolor="#ffffff"];
+  n4 [label="C0-y-x-x  (depth=3)\lblow-up 中心 \{x, y = 0\}, chart x: y -\> x^1*y\lblow-up 後: x*y + x\l単項式 x を括り出し\l正規化後: y + 1\lk=(6, 2)  h=(4, 1)\l単元 -> lambda=5/6, m=1\l", fillcolor="#d8f0d8", penwidth=3, color="#cc3333"];
+  n5 [label="C0-y-x-y  (depth=3)\lblow-up 中心 \{x, y = 0\}, chart y: x -\> y^1*x\lblow-up 後: x*y + y\l単項式 y を括り出し\l正規化後: x + 1\lk=(3, 6)  h=(2, 4)\l単元 -> lambda=5/6, m=1\l", fillcolor="#d8f0d8", penwidth=3, color="#cc3333"];
+  n6 [label="C0-y-y  (depth=2)\lblow-up 中心 \{x, y = 0\}, chart y: x -\> y^1*x\lblow-up 後: x**2*y**2 + y\l単項式 y を括り出し\l正規化後: x**2*y + 1\lk=(0, 3)  h=(0, 2)\l単元 -> lambda=1, m=1\l", fillcolor="#d8f0d8"];
+  n0 -> n1 [label="x"];
+  n0 -> n2 [label="y"];
+  n2 -> n3 [label="x"];
+  n3 -> n4 [label="x"];
+  n3 -> n5 [label="y"];
+  n2 -> n6 [label="y"];
+}

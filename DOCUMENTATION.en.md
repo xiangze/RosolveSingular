@@ -235,6 +235,17 @@ Root box `{|x_j| ≤ ε}`, propagated by the bounds the covering lemma provides:
 | coordinate change `x_v = (y_v−B)/A` | `b'_v = \|A\|max·b_v + \|B\|max` (interval arithmetic) |
 | recentring | `δ` in every direction |
 
+#### Multiplicity from the Newton polyhedron
+
+```python
+newton_multiplicity(f, gens, h=None)
+```
+
+If the diagonal meets the boundary at `p = t*(1,...,1)` and the minimal face
+containing p has dimension d, then `m = n - d`, which equals
+`rank{facet normals through p}`. **This gives the multiplicity a toric
+resolution would produce, without subdividing any fan.**
+
 #### Newton nondegeneracy
 
 ```python
@@ -263,6 +274,32 @@ If the interval collapses to a point the value is determined. Otherwise switch
 to numerical estimation (SGLD) and use the interval to separate estimator bugs
 from genuine difficulty.
 
+### 4.2.5 `ideal_resolve.py` — ideal-carrying resolver (on by default)
+
+```python
+rlct_certified(f, gens, ideal=True, generators=[g1, g2, ...])   # default on
+rlct_interval(f, gens, ideal=True)
+resolve_ideal(generators, gens)                                  # direct
+```
+
+Carries the **generator set** instead of the polynomial `sum g_i^2`. At every
+node it tries: linear reduction, common-monomial extraction (k += 2c),
+**taking a generator as a coordinate** (impossible when only *factors* of the
+polynomial are inspected), termination as soon as the ideal is monomial (exact
+by Howald's LP), then blow-up.
+
+Note: the split `lambda += 1/2` is only valid when k = h = 0, since
+`f = x^k(v^2 + ...)` does not separate in v. The implementation therefore
+performs the coordinate change only and keeps v as a generator.
+
+Effect on Vandermonde cases (ground truth from Aoyagi's formula): H=2 cases go
+from 1 (or failure) to the correct 3/4, 2/3, 1; H=3 still does not terminate.
+
+**Not implemented**: phi is not tracked, so the result cannot be handed to
+`certify` / `lean_export`. Whenever the ideal route's value is adopted the
+status is therefore `unknown`, never `proved`. Use `ideal=False` for the
+previous behaviour.
+
 ### 4.3 `families.py` — family-specific exact routes
 
 Tried in order; the first that applies gives closed-form λ and m.
@@ -273,7 +310,7 @@ Tried in order; the first that applies gives closed-form λ and m.
 | product | variable-disjoint product | `λ = min λ_i`, `m` = sum of `m_i` over minimizers |
 | sum | variable-disjoint sum, each part nonneg | `λ = Σλ_i`, `m = Σm_i − (parts−1)` |
 | power_form | `f = g^p`, g linear or quadratic form | linear: `1/p`; quadratic of rank r: definite `r/2p`, indefinite `min(1/p, r/2p)` |
-| newton | nondegenerate over ℝ | `1/(Newton distance)` |
+| newton | nondegenerate over ℝ | `1/(Newton distance)`, `m` = rank of the facet normals through the diagonal point |
 
 The product rule needs no sign hypothesis (`|f₁f₂| = |f₁||f₂|`); the sum rule
 does need nonnegativity.
@@ -381,16 +418,24 @@ python guards.py                          # are the judges still strict? (gate)
 python run.py --max-vars 4 --random --out r.json
 python report.py r.json
 python run.py --failures                  # re-test archived failures
+python run.py --hard --montecarlo --covering   # hard families + independent checks
+python regression.py --all                     # all suites at once (for CI)
 ```
 
 | File | Role |
 |---|---|
 | `cases.py` | structured families and random ones (n, degree, #terms, coefficient bits varied independently) |
 | `oracles.py` | closed forms, cross-settings agreement, the `1/m ≤ λ ≤ n/m` check |
-| `guards.py` | negative tests that must return refuted + mutation tests |
+| `guards.py` | negative tests, mutation tests, independent checks, Aoyagi lemmas, Vandermonde ground truth, **coordinate invariance**, plus known unfixed bugs (reported outside the gate) |
 | `run.py` | execution and failure classification, JSON output |
 | `report.py` | aggregation: class distribution, routes, proved rate by n and degree, correlation with μ |
 | `failures.py` | failure archive and automatic minimization |
+| `nn_cases.py` | neural-network grid (MLP x {relu, tanh} x degeneracy type), torch-free |
+| `regression.py` | one-shot runner for all suites (guards / structured / random / hard / nn / failures) |
+| `independent.py` | checks that share nothing with the resolver (Monte-Carlo λ from volume asymptotics, forward covering sampling) |
+| `known_families.py` | families that are both hard and have independent ground truth (generic hyperplane arrangements, homogeneous forms, Vandermonde type) |
+| `aoyagi_lemmas.py` | Aoyagi's lemmas (Entropy 2019) turned into truth-free checks: ideal invariance, monotonicity, separation, deepest point |
+| `vandermonde.py` | Ground truth for Vandermonde matrix-type singularities: Aoyagi (2019) Theorem 6 (H<=3) and the exact N=1 formula (both lambda and the order theta) |
 
 #### Failure classes and where to patch
 
@@ -455,6 +500,32 @@ computing the same quantity along two independent routes, internal invariant
 checks, and mutation testing.
 
 ---
+
+## 6.5 Known unfixed bug: coordinate dependence
+
+Rewriting the same function by an invertible change of coordinates with
+Jacobian 1 changes the answer. For the Vandermonde case (M=N=1, H=3, Q=1),
+the local problem in the first blow-up chart
+
+    P = v^4 (G_1^2 + v^2 G_2^2 + v^4 G_3^2),  G_k = a_1 + a_2 b_2^k + a_3 b_3^k
+
+gives lambda = 3/2 in the chart coordinates and 7/6 after taking G_1 as a
+coordinate.
+
+The cause: the resolver carries the **polynomial** sum g_i^2, not the
+**ideal** <g_i>. Since lambda depends only on the ideal (Aoyagi Lemma 1(2)),
+collapsing to a polynomial loses the ability to take a generator as a
+coordinate. `_smooth_factor_change` only inspects *factors* of f_rest, so a
+*summand* like G_1 can never be used.
+
+The fix is to carry the generators in `Chart` and, at every node, try
+(1) linear reduction with constant coefficients, (2) **elimination of regular
+directions**, (3) removal of unit factors, (4) blow-up. Step (2) currently
+runs only once, as preprocessing in `nn_rlct`; it needs to run at every node.
+
+`known_issues()` in `guards.py` reports this mismatch on every run (outside
+the green gate). Once fixed it turns OK and should be promoted to a normal
+guard.
 
 ## 7. Known limitations
 

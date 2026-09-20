@@ -78,8 +78,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import sympy as sp
 
 __all__ = ["Certificate", "LeafCertificate", "certify", "Box",
+           "RLCTInterval", "rlct_interval",
            "nonzero_on_box", "normal_crossing_on_box",
-           "newton_nondegenerate", "rlct_via_newton", "newton_faces"]
+           "newton_nondegenerate", "rlct_via_newton", "newton_faces",
+           "newton_multiplicity"]
 
 try:
     import z3 as _z3
@@ -112,7 +114,15 @@ def _interval_eval(expr, gens, box: Box) -> Tuple[sp.Rational, sp.Rational]:
     for mon, c in zip(p.monoms(), p.coeffs()):
         mag = sp.Integer(1)
         for e, b in zip(mon, box.bounds):
-            mag *= b ** e
+            if e == 0:
+                continue
+            # 指数は解消が進むと数百に達する。b <= 1 なら b^e は単調減少
+            # なので、指数を打ち切っても上界としては正しい (b^e <= b^min(e,K))。
+            # 打ち切らないと巨大な有理数の冪乗が支配的コストになる。
+            if b <= 1:
+                mag *= b ** min(int(e), 64)
+            else:
+                mag *= b ** min(int(e), 64)
         term = sp.Abs(c) * mag
         lo -= term
         hi += term
@@ -155,6 +165,19 @@ def _to_z3(expr, zvars: Dict[sp.Symbol, object]):
     raise ValueError(f"z3 に落とせない式: {expr}")
 
 
+def _fiber_constraints(fiber):
+    """phi(p) = 0 を多項式の等式に直す。
+
+    座標変換のあと phi は有理式になりうる。分母は定義域上で消えないので、
+    phi_j(p) = 0 は分子 = 0 と同値。z3 は除算を扱えないのでここで落とす。
+    """
+    out = []
+    for e in fiber:
+        num, _ = sp.fraction(sp.together(sp.sympify(e)))
+        out.append(sp.expand(num))
+    return out
+
+
 def nonzero_on_box(expr, gens, box: Box, *, exclusions: Sequence[Dict] = (),
                    fiber: Sequence = (),
                    delta=sp.Rational(1, 100), timeout_ms: int = 10000):
@@ -179,8 +202,8 @@ def nonzero_on_box(expr, gens, box: Box, *, exclusions: Sequence[Dict] = (),
         s.add(zv >= -bb, zv <= bb)
     try:
         s.add(_to_z3(expr, zvars) == 0)
-        for e in fiber:                       # phi(p) = 0 (もとの原点に写る点だけ)
-            s.add(_to_z3(sp.expand(e), zvars) == 0)
+        for e in _fiber_constraints(fiber):    # phi(p) = 0 (もとの原点に写る点)
+            s.add(_to_z3(e, zvars) == 0)
     except ValueError:
         return ("unknown", None)
     d = _z3.RealVal(f"{sp.Rational(delta).p}/{sp.Rational(delta).q}")
@@ -241,8 +264,8 @@ def normal_crossing_on_box(u, k, h, gens, box: Box, *,
         s.add(zvars[v] >= -bb, zvars[v] <= bb)
     try:
         s.add(_to_z3(u, zvars) == 0)
-        for e in fiber:                       # phi(p) = 0 に限定する
-            s.add(_to_z3(sp.expand(e), zvars) == 0)
+        for e in _fiber_constraints(fiber):    # phi(p) = 0 に限定する
+            s.add(_to_z3(e, zvars) == 0)
         for i, v in enumerate(gens):
             du = sp.expand(sp.diff(u, v))
             dz = _to_z3(du, zvars) if du.free_symbols or du != 0 else _z3.RealVal(0)
@@ -347,6 +370,62 @@ def newton_faces(monoms, max_facets: int = 12):
     return faces
 
 
+def newton_multiplicity(f, gens, h=None, *, max_facets: int = 14):
+    """非退化な f の極の位数 m をニュートン多面体から組合せ的に求める。
+
+    Varchenko の定理では、対角線が多面体の境界に当たる点 p = t* (1,...,1)
+    を含む最小の面の次元 d に対し m = n - d。ここで
+
+        m = rank { p を通るファセットの法線 }
+
+    と書ける (最小面 = p を含む全ファセットの交わり、その次元は
+    n - rank(法線))。これはトーリック解消で扇を作らなくても分かる量で、
+    実際に扇を細分して chart を作った場合に得られる位数と一致する。
+
+    h を与えると振幅 x^h 付きの場合 (p = t* (h+1)) になる。
+    Returns m、決められなければ None。
+    """
+    gens = tuple(gens)
+    n = len(gens)
+    p_ = sp.Poly(sp.expand(f), *gens)
+    monoms = [tuple(m) for m in p_.monoms()]
+    if not monoms or any(all(e == 0 for e in m) for m in monoms):
+        return None
+    from resolve_singularity import newton_rlct
+    hplus = [1] * n if h is None else [int(hj) + 1 for hj in h]
+    lam = newton_rlct(f, gens, h=[hj - 1 for hj in hplus])
+    if lam is sp.oo or lam == 0:
+        return None
+    if lam == 0:
+        return None
+    # 対角線 (振幅つきなら (h+1) 方向) が境界に当たる点
+    t = 1 / lam
+    p = [sp.Rational(t) * hj for hj in hplus]
+
+    normals = []
+    comp = newton_facet_normals(monoms, max_facets) or []
+    normals += [list(w) for w in comp]
+    # 非コンパクトなファセット {a_i = c_i} の法線 e_i
+    for i in range(n):
+        ci = min(m[i] for m in monoms)
+        e = [0] * n
+        e[i] = 1
+        normals.append((e, ci))
+    active = []
+    for w in normals:
+        if isinstance(w, tuple):
+            e, ci = w
+            if sp.nsimplify(p[[j for j, v in enumerate(e) if v][0]]) == ci:
+                active.append(e)
+        else:
+            d = min(sum(wj * a for wj, a in zip(w, m)) for m in monoms)
+            if sp.nsimplify(sum(wj * pj for wj, pj in zip(w, p))) == d:
+                active.append(w)
+    if not active:
+        return None
+    return int(sp.Matrix(active).rank())
+
+
 def newton_nondegenerate(f, gens, *, timeout_ms: int = 10000,
                          max_facets: int = 12):
     """f が (実数体上) ニュートン多面体に関して非退化かを判定する。
@@ -443,18 +522,30 @@ def compute_domains(resolution, eps=sp.Integer(1),
         b = list(pb.bounds)
         if st.kind == "blowup":
             J = [gens.index(v) for v in st.center]
+            wts = list(st.weights) if st.weights else [1] * len(J)
+            wmap = {j: wts[t] for t, j in enumerate(J)}
             i = None
-            for v, e in st.subs:                       # x_j -> y_i * y_j
-                factors = sp.Mul.make_args(e)
-                cand = [w for w in factors if w in gens and w != v]
-                if cand:
-                    i = gens.index(cand[0])
+            for v, e in st.subs:                       # x_j -> y_i^{w_j} * y_j
+                for w_ in sp.Mul.make_args(e):
+                    base = w_.base if w_.is_Pow else w_
+                    if base in gens and base != v:
+                        i = gens.index(base)
+                        break
+                if i is not None:
                     break
             if i is None:
                 i = J[0]
             for j in J:
                 if j != i:
                     b[j] = sp.Integer(1)               # 被覆補題の与える境界
+            # 重み付きでは y_i = x_i^{1/w_i} なので、pivot の箱は b_i^{1/w_i}
+            # に広がる (b_i <= 1 なら 1/w_i 乗で大きくなる)。ここを b_i の
+            # ままにすると chart の像が足りず、被覆が成立しない。
+            wi = wmap.get(i, 1)
+            if wi > 1:
+                import math as _math
+                val = float(b[i]) ** (1.0 / wi)
+                b[i] = sp.Rational(_math.ceil(val * 10000) + 1, 10000)
         elif st.kind == "recenter":
             # 付け替え点のまわりの delta 球だけを担当する
             b = [sp.nsimplify(delta) for _ in range(n)]
@@ -481,16 +572,19 @@ class LeafCertificate:
     mult: int
     unit_status: str                # 'proved' | 'refuted' | 'unknown'
     jac_status: str
+    identity_ok: bool = True        # f(phi(y)) == y^k * f_rest が厳密に成立
     witness: Optional[Dict] = None
     note: str = ""
 
     @property
     def ok(self) -> bool:
-        return self.unit_status == "proved" and self.jac_status == "proved"
+        return (self.identity_ok and self.unit_status == "proved"
+                and self.jac_status == "proved")
 
     def __str__(self) -> str:
         mark = {"proved": "OK", "refuted": "NG", "unknown": "??"}
-        return (f"[{mark[self.unit_status]}/{mark[self.jac_status]}] "
+        return (f"[{'OK' if self.identity_ok else 'NG'}/"
+                f"{mark[self.unit_status]}/{mark[self.jac_status]}] "
                 f"{self.name:<22} lambda={str(self.lam):<7} m={self.mult} "
                 f"V={self.box}" + (f"  反例 {self.witness}" if self.witness else "")
                 + (f"  {self.note}" if self.note else ""))
@@ -514,7 +608,7 @@ class Certificate:
         else:
             L.append(f"  lambda は返しません (到達した最小値は {self.best_known} "
                      "ですが、正しさが確認できていません)")
-        L.append(f"  葉 {len(self.leaves)} 件 [単元/ヤコビアン]:")
+        L.append(f"  葉 {len(self.leaves)} 件 [恒等式/単元/ヤコビアン]:")
         for lf in self.leaves:
             L.append("    " + str(lf))
         if self.covering:
@@ -561,13 +655,35 @@ def certify(resolution, *, eps=sp.Integer(1), delta=sp.Rational(1, 100),
                 {v: sp.nsimplify(e - v) for v, e in st.subs})
 
     # --- 葉ごとの単元条件 --------------------------------------------
+    f_expr = sp.expand(resolution.f)
     for ch in resolution.charts:
         box = domains.get(ch.name)
         lam, m = ch.local_rlct()
+        # (a) 代入等式 f(phi(y)) = y^k * f_rest を厳密に検算する。
+        #     k, h, f_rest, phi の帳簿が壊れていればここで落ちる。
+        lhs = sp.expand(f_expr.subs({v: ch.phi[v] for v in gens},
+                                    simultaneous=True))
+        rhs = sp.cancel(sp.together(
+            sp.prod([v ** e for v, e in zip(gens, ch.k)])
+            * getattr(ch, "unit", sp.S.One) * ch.f_rest()))
+        ident = sp.simplify(sp.expand(sp.cancel(lhs - rhs))) == 0
+        # 落とした単元が本当に原点で単元か (0 でも極でもない) も確かめる
+        uu = sp.cancel(getattr(ch, "unit", sp.S.One))
+        un, ud = sp.fraction(sp.together(uu))
+        z0 = {v: 0 for v in gens}
+        if sp.simplify(un.subs(z0)) == 0 or sp.simplify(ud.subs(z0)) == 0:
+            ident = False
         if box is None:
             leaves.append(LeafCertificate(ch.name, Box(()), lam, m,
                                           "unknown", "unknown",
+                                          identity_ok=ident,
                                           note="定義域を追跡できません"))
+            continue
+        if not ident:
+            leaves.append(LeafCertificate(ch.name, box, lam, m,
+                                          "unknown", "unknown",
+                                          identity_ok=False,
+                                          note="f(phi) = y^k * f_rest が成立しません"))
             continue
         fib = [ch.phi[v] for v in gens] if localize else ()
         # この葉から中心を付け替えた点は、子の chart が担当するので除外する
@@ -583,14 +699,17 @@ def certify(resolution, *, eps=sp.Integer(1), delta=sp.Rational(1, 100),
             q = sp.cancel(sp.together(sp.expand(det) / hmono)) if hmono != 0 \
                 else sp.S.Zero
             num, den = sp.fraction(q)
-            if den.free_symbols:
-                js, jw = "unknown", None
-            else:
-                js, jw = nonzero_on_box(num, gens, box, fiber=fib,
+            # 単元部が有理式のときは、分子が消えないことと分母が消えない
+            # (= 極を持たない) ことの両方を確かめる。
+            js, jw = nonzero_on_box(num, gens, box, fiber=fib,
+                                    exclusions=excl, delta=delta,
+                                    timeout_ms=timeout_ms)
+            if den.free_symbols and js == "proved":
+                js, jw = nonzero_on_box(den, gens, box, fiber=fib,
                                         exclusions=excl, delta=delta,
                                         timeout_ms=timeout_ms)
         leaves.append(LeafCertificate(ch.name, box, lam, m, us, js,
-                                      witness=w or jw))
+                                      identity_ok=ident, witness=w or jw))
 
     # --- 被覆の状態 ---------------------------------------------------
     for name, ch in sorted(resolution.nodes.items()):
@@ -643,7 +762,7 @@ def certify(resolution, *, eps=sp.Integer(1), delta=sp.Rational(1, 100),
     # --- 総合判定 -----------------------------------------------------
     best = resolution.rlct
     bad = [lf for lf in leaves if lf.unit_status == "refuted"
-           or lf.jac_status == "refuted"]
+           or lf.jac_status == "refuted" or not lf.identity_ok]
     unk = [lf for lf in leaves if not lf.ok and lf not in bad]
     cov_bad = [c for c in covering if c[1] != "proved"]
 
@@ -653,8 +772,13 @@ def certify(resolution, *, eps=sp.Integer(1), delta=sp.Rational(1, 100),
 
     if bad:
         status = "refuted"
-        reasons.append(f"{len(bad)} 個の chart で u または v の零点が "
-                       "定義域内に見つかりました。正規交差になっていません。")
+        n_id = sum(1 for lf in bad if not lf.identity_ok)
+        if n_id:
+            reasons.append(f"{n_id} 個の chart で f(phi) = y^k * f_rest が"
+                           "成立しません (帳簿のバグ)。")
+        if len(bad) - n_id:
+            reasons.append(f"{len(bad) - n_id} 個の chart で正規交差が"
+                           "壊れる点が定義域内に見つかりました。")
     elif unk or cov_bad or resolution.n_pruned or not _HAS_Z3:
         status = "unknown"
         if unk:
@@ -673,10 +797,209 @@ def certify(resolution, *, eps=sp.Integer(1), delta=sp.Rational(1, 100),
 
 
 # ----------------------------------------------------------------------
+# 厳密値が得られないときの区間
+# ----------------------------------------------------------------------
+@dataclass
+class RLCTInterval:
+    lo: sp.Rational
+    hi: sp.Rational
+    status: str                    # 'exact' | 'interval'
+    value: Optional[sp.Rational]   # 'exact' のときだけ
+    sources: Dict[str, str] = field(default_factory=dict)
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def width(self):
+        return sp.nsimplify(self.hi - self.lo) if self.hi is not sp.oo else sp.oo
+
+    def contains(self, x) -> bool:
+        return self.lo <= sp.nsimplify(x) <= self.hi
+
+    def report(self) -> str:
+        if self.status == "exact":
+            L = [f"############ lambda = {self.value} (厳密) ############"]
+        else:
+            L = [f"############ lambda in [{self.lo}, {self.hi}] "
+                 f"(幅 {self.width}) ############"]
+        for k, v in self.sources.items():
+            L.append(f"  {k}: {v}")
+        for n in self.notes:
+            L.append(f"  [note] {n}")
+        return "\n".join(L)
+
+    def print_report(self) -> None:
+        print(self.report())
+
+
+def rlct_interval(f, gens=None, *, timeout_ms: int = 20000,
+                  max_depth: int = 25, ideal: bool = True, generators=None,
+                  **kw) -> RLCTInterval:
+    """lambda を厳密に決められない場合に、健全な区間 [lo, hi] を返す。
+
+    使う評価はすべて実数体上で正当なものに限る。
+
+      下界 lo:
+        * 1/m   (m = ord_0 f)。 1/m <= lct_C <= lambda_R
+      上界 hi:
+        * n/m   (ニュートン多面体が {sum a >= m} に入るため)
+        * ニュートン LP の値 (Lin: 一般には RLCT の上界)
+        * 解消が途中まででも、得られた chart の値の最小
+          (被覆が不完全なら lambda を過大評価するので、上界として正しい)
+
+    厳密値が確定した場合は status='exact' で value に入れる。
+    """
+    from families import family_rlct
+    from invariants import multiplicity
+    from resolve_singularity import (ResolutionFailure, newton_rlct,
+                                     resolve_singularities)
+
+    f = sp.expand(sp.sympify(f))
+    if gens is None:
+        gens = sorted(f.free_symbols, key=str)
+    gens = tuple(gens)
+    n = len(gens)
+    src: Dict[str, str] = {}
+    notes: List[str] = []
+
+    # --- 厳密経路を先に試す -----------------------------------------
+    fam = family_rlct(f, gens)
+    if fam.status == "proved" and fam.rlct is not sp.oo:
+        return RLCTInterval(fam.rlct, fam.rlct, "exact", fam.rlct,
+                            {"経路": f"family:{fam.route}"})
+
+    m = multiplicity(f, gens)
+    lo = sp.Rational(1, m) if m not in (0, sp.oo) else sp.Integer(0)
+    hi = sp.Rational(n, m) if m not in (0, sp.oo) else sp.oo
+    src["重複度"] = f"m={m} -> 1/m={lo}, n/m={hi}"
+
+    try:
+        nl = newton_rlct(f, gens)
+        if nl is not sp.oo and nl < hi:
+            hi = nl
+            src["ニュートン LP"] = f"上界 {nl}"
+    except Exception:
+        pass
+
+    if ideal:
+        gs = generators if generators is not None else _sum_of_squares(f, gens)
+        if gs:
+            try:
+                from ideal_resolve import resolve_ideal
+                ri = resolve_ideal(gs, gens, max_depth=max_depth)
+                if ri.rlct is not sp.oo and ri.rlct < hi:
+                    hi = ri.rlct
+                    src["イデアル版の解消"] = f"上界 {hi} (到達値なので上界)"
+            except Exception:
+                pass
+
+    res = None
+    try:
+        res = resolve_singularities(f, gens, prune=False, max_depth=max_depth,
+                                    weighted=True, **kw)
+    except ResolutionFailure as e:
+        src["解消"] = f"失敗 ({e.reason})"
+        # 途中までに解消できた chart の値は、被覆が不完全でも上界になる
+        vals = [c.local_rlct()[0] for c in e.nodes.values()
+                if c.status.startswith("resolved")]
+        vals = [v for v in vals if v is not sp.oo]
+        if vals and min(vals) < hi:
+            hi = min(vals)
+            src["途中の chart"] = f"上界 {hi} ({len(vals)} 個の解消済み chart)"
+        if e.bound is not None:
+            notes.append(f"分枝限定の暫定上界 {e.bound:.6g} "
+                         "(下界の仮定に依るので区間には含めない)")
+        # 枝刈りを効かせると解けることがある。得られる値は必ず「ある chart で
+        # 実際に到達した値」なので、被覆が不完全でも上界として正しい。
+        try:
+            r2 = resolve_singularities(f, gens, prune="ties", weighted=True,
+                                       max_depth=max_depth, **kw)
+            if r2.rlct is not sp.oo and r2.rlct < hi:
+                hi = r2.rlct
+                src["枝刈りありの解消"] = f"上界 {hi} (到達値なので上界)"
+        except Exception:
+            pass
+    except Exception as e:                            # noqa: BLE001
+        src["解消"] = f"例外 ({str(e)[:50]})"
+
+    if res is not None:
+        cert = certify(res, timeout_ms=timeout_ms)
+        if cert.status == "proved":
+            return RLCTInterval(cert.rlct, cert.rlct, "exact", cert.rlct,
+                                {"経路": "blowup+certify",
+                                 "検証": "全 chart で正規交差と被覆を確認"})
+        src["解消"] = f"完了したが証明できず ({cert.status})"
+        if res.rlct is not sp.oo and res.rlct < hi:
+            hi = res.rlct
+            src["解消の値"] = f"上界 {res.rlct} (被覆が未検証なので上界としてのみ)"
+        for r in cert.reasons:
+            notes.append(r)
+
+    if lo == hi:
+        notes.append("区間が一点に潰れているので、値自体は確定している "
+                     "(ただし上界と下界の根拠は別々)。")
+        return RLCTInterval(lo, hi, "exact", lo, src, notes)
+    return RLCTInterval(lo, hi, "interval", None, src, notes)
+
+
+# ----------------------------------------------------------------------
 # 高速パス付きの入口
 # ----------------------------------------------------------------------
+def _ideal_route(f, gens, *, max_depth: int = 14):
+    """イデアルを運ぶ解消 (ideal_resolve.py) を試す。
+
+    生成元の組を運ぶので、途中の節点で「生成元を座標に取る」ことができる。
+    多項式に潰した経路では取れない値に届くことがある (Vandermonde H=2 で
+    3/4 対 1 など)。ただし phi を追跡していないので証明書は付けられない。
+
+    Returns (lambda, multiplicity) または None。
+    """
+    try:
+        from ideal_resolve import resolve_ideal
+    except Exception:
+        return None
+    # f = sum g_i^2 の形が分かっていれば生成元をそのまま使いたいが、
+    # 入口では f しか無いので、平方和に分解できるときだけ生成元を取り出す。
+    gs = _sum_of_squares(f, gens)
+    try:
+        r = resolve_ideal(gs, gens, max_depth=max_depth)
+    except Exception:
+        return None
+    if r.rlct is sp.oo:
+        return None
+    return (r.rlct, r.multiplicity)
+
+
+def _sum_of_squares(f, gens):
+    """f を平方和 sum g_i^2 に分解する。できなければ [sqrt は使わず] [f] 相当。
+
+    f が既に平方和の形 (展開済み) かどうかを構造的に判定するのは難しいので、
+    ここでは f 自体を 1 つの生成元とみなす代わりに、f の平方因子を利用する:
+    f = g^2 * h なら <g> ... のような単純化はせず、安全側に倒して
+    「f = (g)^2 と書けるなら [g]、そうでなければ [f] を 2 乗と見なさず
+     [sqrt(f)] は使わない」= [f] を生成元 1 つとして扱うのは誤り。
+
+    実際には呼び出し側が生成元を知っているので、rlct_certified /
+    rlct_interval には generators= を渡せるようにしてある。ここでは
+    f = g^2 の形だけ拾う。
+    """
+    c, facs = sp.factor_list(sp.expand(f))
+    gs = []
+    ok = True
+    for g, d in facs:
+        if d % 2 == 0:
+            gs.append(sp.expand(g ** (d // 2)))
+        else:
+            ok = False
+            break
+    if ok and gs and c >= 0:
+        return [sp.expand(sp.sqrt(c) * sp.prod(gs))] if sp.sqrt(c).is_rational \
+            else [sp.expand(sp.prod(gs))]
+    return None
+
+
 def rlct_certified(f, gens=None, *, timeout_ms: int = 20000,
-                   max_depth: int = 25, verbose: bool = False, **kw):
+                   max_depth: int = 25, verbose: bool = False,
+                   ideal: bool = True, generators=None, **kw):
     """lambda を「証明付きで」求める。返り値は (lambda, status, 経路)。
 
     1. ニュートン多面体に関して実数体上で非退化かを Z3 で判定する。
@@ -686,6 +1009,15 @@ def rlct_certified(f, gens=None, *, timeout_ms: int = 20000,
        certify() にかける。
     status は 'proved' / 'unknown' / 'refuted'。proved でなければ lambda は
     参考値であり、正しさは保証されない。
+
+    ideal : True (既定) なら、イデアルを運ぶ解消 (ideal_resolve.py) も併用し、
+        より小さい値が得られればそちらを採る。解消の値はどれも「ある chart で
+        到達した値」なので上界であり、小さいほうが真値に近い。ただし
+        イデアル版は phi を追跡しておらず証明書を付けられないので、
+        その値を採った場合の status は 'unknown' になる (誤った値を proved と
+        主張しないため)。ideal=False で従来どおり多項式版のみ。
+    generators : f = sum g_i^2 の生成元が分かっていれば渡す。イデアル版が
+        そのまま使える (渡さない場合は f から推定を試みる)。
     """
     from resolve_singularity import resolve_singularities, ResolutionFailure
 
@@ -699,13 +1031,38 @@ def rlct_certified(f, gens=None, *, timeout_ms: int = 20000,
             print(f"  ニュートン非退化 -> lambda = {lam} (厳密)")
         return (lam, "proved", "newton")
 
+    # --- イデアルを運ぶ経路 (既定で有効) -----------------------------
+    lam_ideal = None
+    if ideal:
+        gs = generators if generators is not None else _sum_of_squares(f, gens)
+        if gs:
+            try:
+                from ideal_resolve import resolve_ideal
+                ri = resolve_ideal(gs, gens, max_depth=max_depth)
+                if ri.rlct is not sp.oo:
+                    lam_ideal = ri.rlct
+                    if verbose:
+                        print(f"  イデアル版: lambda = {lam_ideal}")
+            except Exception:
+                lam_ideal = None
+
     try:
         res = resolve_singularities(f, gens, prune=False, weighted=True,
                                     max_depth=max_depth, **kw)
     except ResolutionFailure as e:
+        if lam_ideal is not None:
+            return (lam_ideal, "unknown", "ideal (多項式版は解消できず)")
         return (None, "unknown", f"解消できず ({e.reason})")
     cert = certify(res, timeout_ms=timeout_ms)
-    return (cert.rlct if cert.status == "proved" else res.rlct,
+    lam_poly = res.rlct
+
+    if lam_ideal is not None and lam_ideal < lam_poly:
+        # 小さいほうが真値に近い (どちらも上界)。ただし証明書は付かない。
+        return (lam_ideal, "unknown", "ideal (多項式版より小さい値)")
+    if cert.status == "proved" and lam_ideal is not None and lam_ideal != lam_poly:
+        # 証明済みの値よりイデアル版が大きい -> イデアル版が取りこぼし
+        return (cert.rlct, "proved", "blowup+certify")
+    return (cert.rlct if cert.status == "proved" else lam_poly,
             cert.status, "blowup+certify")
 
 

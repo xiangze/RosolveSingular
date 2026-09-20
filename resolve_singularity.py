@@ -366,15 +366,21 @@ class Step:
 
     kind: str          # 'init' | 'blowup' | 'normalize' | 'coordchg' | 'recenter'
     detail: str        # 人間可読な説明
-    f_rest: sp.Expr    # 変形後の単元候補
+    f_rest: object     # 変形後の単元候補 (Poly のまま保持し、表示時に変換)
     k: Tuple[int, ...]
     h: Tuple[int, ...]
     subs: Tuple[Tuple[sp.Symbol, sp.Expr], ...] = ()   # この変形の座標置換
+
+    def expr(self) -> sp.Expr:
+        """表示用。Poly -> Expr の変換 (expr_from_dict) は重いので遅延する。"""
+        f = self.f_rest
+        return f.as_expr() if isinstance(f, sp.Poly) else f
     center: Tuple[sp.Symbol, ...] = ()                 # blow-up の中心 (変数の組)
     weights: Tuple[int, ...] = ()                      # 重み付きブローアップの重み
 
     def __str__(self) -> str:
-        return f"[{self.kind:<9}] {self.detail}\n            f_rest = {self.f_rest}\n            k = {self.k}, h = {self.h}"
+        return (f"[{self.kind:<9}] {self.detail}\n            "
+                f"f_rest = {self.expr()}\n            k = {self.k}, h = {self.h}")
 
 
 @dataclass
@@ -386,6 +392,7 @@ class Chart:
     k: List[int]                        # f から括り出した単項式の指数
     h: List[int]                        # ヤコビアンの単項式の指数
     phi: Dict[sp.Symbol, sp.Expr]       # 現在の座標 -> もとの座標 への写像
+    unit: sp.Expr = sp.S.One            # 途中で落とした単元 (恒等式を厳密に保つ)
     steps: List[Step] = field(default_factory=list)
     depth: int = 0
     resolved: bool = False
@@ -405,7 +412,18 @@ class Chart:
         return self.poly.gens
 
     def f_rest(self) -> sp.Expr:
-        return self.poly.as_expr()
+        # Poly -> Expr の変換 (expr_from_dict) はプロファイル上で最も重い。
+        # 同じ chart で何度も呼ばれるのでキャッシュする。
+        c = getattr(self, "_f_rest_cache", None)
+        if c is not None and c[0] is self.poly:
+            return c[1]
+        e = self.poly.as_expr()
+        object.__setattr__(self, "_f_rest_cache", (self.poly, e))
+        return e
+
+    def identity(self) -> Tuple[sp.Expr, sp.Expr]:
+        """恒等式 f(phi(y)) = y^k * unit * f_rest の右辺を組み立てる。"""
+        return (self.monomial() * self.unit * self.f_rest())
 
     def monomial(self) -> sp.Expr:
         """f = monomial * f_rest となる単項式 x^k。"""
@@ -655,7 +673,7 @@ def _weighted_blowup_poly(p: sp.Poly, i: int, J: Sequence[int],
         cc = c * (sign ** mon[i]) if sign < 0 else c
         key = tuple(e)
         acc[key] = acc.get(key, sp.S.Zero) + cc
-    acc = {kk: sp.simplify(vv) for kk, vv in acc.items()}
+    # 係数は有理数なので和は既に正規形。simplify は不要 (呼ぶと支配的コスト)
     acc = {kk: vv for kk, vv in acc.items() if vv != 0}
     if not acc:
         raise ResolutionFailure("重み付きブローアップ後に f が消えました (異常)。")
@@ -681,7 +699,6 @@ def _blowup_poly(p: sp.Poly, i: int, J: Sequence[int]) -> sp.Poly:
         e[i] = mon[i] + sum(mon[j] for j in shift)
         key = tuple(e)
         acc[key] = acc.get(key, sp.S.Zero) + c
-    acc = {kk: sp.simplify(vv) for kk, vv in acc.items()}
     acc = {kk: vv for kk, vv in acc.items() if vv != 0}
     if not acc:  # 単項式変換は torus 上単射なので通常起こらない
         raise ResolutionFailure("ブローアップ後に f が消えました (異常)。")
@@ -805,6 +822,33 @@ def _offorigin_centers(chart: Chart, max_solutions: int = 4):
     return found
 
 
+_FACTOR_CACHE: Dict[str, object] = {}
+
+
+def _cached_factor_list(expr, max_terms: int = 80):
+    """factor_list はコストが高く、同じ多項式に対して複数回呼ばれるので
+    キャッシュする。項数が多いものは因数分解の効果より costs が上回るので
+    諦める (単元因子の除去も滑らかな因子の座標化も「できなければ
+    ブローアップに回る」だけで正しさには影響しない)。"""
+    try:
+        pe = sp.Poly(expr)
+        if len(pe.monoms()) > max_terms:
+            return None
+    except Exception:
+        pass
+    key = sp.srepr(expr)
+    if key in _FACTOR_CACHE:
+        return _FACTOR_CACHE[key]
+    try:
+        r = sp.factor_list(expr)
+    except Exception:
+        r = None
+    if len(_FACTOR_CACHE) > 4000:
+        _FACTOR_CACHE.clear()
+    _FACTOR_CACHE[key] = r
+    return r
+
+
 def _drop_unit_factors(p: sp.Poly) -> Tuple[sp.Poly, sp.Expr]:
     """原点で消えない因子 (単元) を f_rest から取り除く。
 
@@ -815,10 +859,10 @@ def _drop_unit_factors(p: sp.Poly) -> Tuple[sp.Poly, sp.Expr]:
     """
     gens = p.gens
     zero = {v: 0 for v in gens}
-    try:
-        c, facs = sp.factor_list(p.as_expr())
-    except Exception:
+    r = _cached_factor_list(p.as_expr())
+    if r is None:
         return p, sp.S.One
+    c, facs = r
     keep, unit = [], sp.Integer(1) * c
     for g, d in facs:
         if g.subs(zero) != 0:
@@ -848,7 +892,10 @@ def _smooth_factor_change(chart: Chart, name: str) -> Optional["Chart"]:
     free = {v for v, kv, hv in zip(gens, chart.k, chart.h) if kv == 0 and hv == 0}
     if not free:
         return None
-    _, facs = sp.factor_list(chart.f_rest())
+    _r = _cached_factor_list(chart.f_rest())
+    if _r is None:
+        return None
+    _, facs = _r
     zero = {v: 0 for v in gens}
     for g, d in facs:
         if g.subs(zero) != 0:          # 単元因子は無視
@@ -873,9 +920,10 @@ def _smooth_factor_change(chart: Chart, name: str) -> Optional["Chart"]:
                 w: sp.cancel(sp.together(e.subs(sub, simultaneous=True)))
                 for w, e in chart.phi.items()
             }
+            new_unit = sp.cancel(chart.unit.subs(sub, simultaneous=True) / den)
             detail = (f"滑らかな因子の座標化: {v} -> ({v} - ({B}))/({A})"
                       f"  [因子 ({g})^{d} を {v}^{d} に]")
-            step = Step("coordchg", detail, new_poly.as_expr(),
+            step = Step("coordchg", detail, new_poly,
                         tuple(chart.k), tuple(chart.h),
                         subs=tuple(sub.items()))
             return Chart(
@@ -884,6 +932,7 @@ def _smooth_factor_change(chart: Chart, name: str) -> Optional["Chart"]:
                 k=list(chart.k),
                 h=list(chart.h),
                 phi=new_phi,
+                unit=new_unit,
                 steps=chart.steps + [step],
                 depth=chart.depth + 1,
                 parent=chart.name,
@@ -902,8 +951,12 @@ def _recenter(chart: Chart, point: Dict[sp.Symbol, sp.Expr], name: str) -> Chart
     new_k = [0 if point.get(v, 0) != 0 else kj for v, kj in zip(gens, chart.k)]
     new_h = [0 if point.get(v, 0) != 0 else hj for v, hj in zip(gens, chart.h)]
     new_phi = {v: sp.expand(expr.subs(shift, simultaneous=True)) for v, expr in chart.phi.items()}
+    absorbed = sp.prod([(v + point[v]) ** kj
+                        for v, kj in zip(gens, chart.k)
+                        if point.get(v, 0) != 0])
+    new_unit = sp.cancel(chart.unit.subs(shift, simultaneous=True) * absorbed)
     detail = "中心の付け替え: " + ", ".join(f"{v} -> {v} + {c}" for v, c in point.items() if c != 0)
-    step = Step("recenter", detail, new_poly.as_expr(), tuple(new_k), tuple(new_h),
+    step = Step("recenter", detail, new_poly, tuple(new_k), tuple(new_h),
                 subs=tuple(shift.items()))
     return Chart(
         name=name,
@@ -911,6 +964,7 @@ def _recenter(chart: Chart, point: Dict[sp.Symbol, sp.Expr], name: str) -> Chart
         k=new_k,
         h=new_h,
         phi=new_phi,
+        unit=new_unit,
         steps=chart.steps + [step],
         depth=chart.depth + 1,
         parent=chart.name,
@@ -933,6 +987,7 @@ def resolve_singularities(
     drop_unit_factors: bool = True,
     center: str = "min",
     weighted: bool = False,
+    h0: Optional[Sequence[int]] = None,
     prune=True,
     lp_backend: str = "auto",
     keep_tree: bool = True,
@@ -952,6 +1007,10 @@ def resolve_singularities(
         これを超えても解消できない chart があれば ResolutionFailure。
     max_charts : int
         生成する chart 数の上限 (組合せ爆発への保険)。超えたら例外。
+    h0 : list of int, optional
+        振幅 x^{h0} を初期値として与える。ブローアップの chart の中の
+        局所問題を直接扱いたいときに使う (親の chart から受け継いだ
+        ヤコビアンの指数を渡す)。
     weighted : bool
         重み付きブローアップを使う。ニュートン多面体のファセット法線を
         重み w > 0 に取り、x_i = y_i^{w_i}, x_j = y_i^{w_j} y_j とする。
@@ -1015,7 +1074,7 @@ def resolve_singularities(
         name="C0",
         poly=p0,
         k=[0] * n,
-        h=[0] * n,
+        h=([int(v) for v in h0] if h0 is not None else [0] * n),
         phi={v: v for v in gens},
         steps=[Step("init", f"f = {sp.expand(f)}", p0.as_expr(), (0,) * n, (0,) * n)],
         depth=0,
@@ -1053,7 +1112,7 @@ def resolve_singularities(
             ch.k = [kj + aj for kj, aj in zip(ch.k, a)]
             mono = sp.prod([v ** e for v, e in zip(gens, a)])
             ch.steps.append(
-                Step("normalize", f"単項式 {mono} を括り出し", q.as_expr(),
+                Step("normalize", f"単項式 {mono} を括り出し", q,
                      tuple(ch.k), tuple(ch.h))
             )
 
@@ -1063,9 +1122,10 @@ def resolve_singularities(
         if not unit and drop_unit_factors:
             q2, u = _drop_unit_factors(ch.poly)
             if u != 1:
+                ch.unit = sp.cancel(ch.unit * u)
                 ch.poly = q2
                 ch.steps.append(
-                    Step("normalize", f"単元因子 ({u}) を除去", q2.as_expr(),
+                    Step("normalize", f"単元因子 ({u}) を除去", q2,
                          tuple(ch.k), tuple(ch.h))
                 )
                 unit = _is_unit_at_origin(ch.poly)
@@ -1185,15 +1245,32 @@ def resolve_singularities(
         # 重み付きブローアップの重み (weighted=False なら全部 1 = 通常のもの)
         w = [1] * n
         if weighted:
-            cand = _newton_weight(ch.poly)
+            # 擬斉次性は連立一次方程式で厳密に判定できる (invariants.py)。
+            # LP 由来の候補に頼らずに済むので、まずこちらを試す。
+            try:
+                from invariants import quasihomogeneous_weights
+                qh = quasihomogeneous_weights(ch.poly.as_expr(), gens)
+            except Exception:
+                qh = None
+            if qh and any(v != 1 for v in qh[0]) and max(qh[0]) <= 500:
+                w = list(qh[0])
+            cand = None if w != [1] * n else _newton_weight(ch.poly)
             if cand and any(c != 1 for c in cand):
                 degs = {sum(c * e for c, e in zip(cand, m))
                         for m in ch.poly.monoms()}
-                # 重み付きが効くのは f_rest が w について擬斉次なとき。
-                # そのとき 1 回で y_i^d * (横断的な部分) になる。
-                # そうでない場合に使うと逆に反復が増えて止まらなくなるので、
-                # 通常のブローアップに落とす。
-                if len(degs) == 1:
+                rule = weighted if isinstance(weighted, str) else "quasihom"
+                if rule == "always":
+                    w = cand
+                elif rule == "initial":
+                    # 重み最小の部分 (initial form) が単項式でなければ使う。
+                    # 単項式なら重み付きにしても新しい情報が出ない。
+                    d0 = min(degs)
+                    n_init = sum(1 for m in ch.poly.monoms()
+                                 if sum(c * e for c, e in zip(cand, m)) == d0)
+                    if n_init >= 2:
+                        w = cand
+                elif len(degs) == 1:
+                    # 既定: f_rest が w について擬斉次なときだけ使う
                     w = cand
         chart_ids = []
         for i in J:
@@ -1212,9 +1289,6 @@ def resolve_singularities(
                     reason="max_charts",
                 )
             new_poly = _weighted_blowup_poly(ch.poly, i, J, w, sgn)
-            if sgn < 0 and ch.k[i] % 2 == 1:
-                # x^k の側から出る符号も単元に取り込む (恒等式を厳密に保つ)
-                new_poly = sp.Poly(-new_poly.as_expr(), *gens)
             new_k = _weighted_pushforward(ch.k, i, J, w)
             new_h = _weighted_pushforward(ch.h, i, J, w)
             new_h[i] += sum(w[j] for j in J) - 1   # ヤコビアン y_i^{sum w - 1}
@@ -1222,6 +1296,10 @@ def resolve_singularities(
             if w[i] != 1 or sgn < 0:
                 sub[gens[i]] = sgn * gens[i] ** w[i]
             new_phi = {v: sp.expand(e.subs(sub, simultaneous=True)) for v, e in ch.phi.items()}
+            new_unit = sp.cancel(ch.unit.subs(sub, simultaneous=True)) \
+                if ch.unit != 1 else sp.S.One
+            if sgn < 0 and ch.k[i] % 2 == 1:
+                new_unit = -new_unit
             wtxt = "" if all(w[j] == 1 for j in J) else f" 重み {[w[j] for j in J]}"
             stxt = "" if sgn > 0 else " (符号 -)"
             detail = (
@@ -1238,7 +1316,8 @@ def resolve_singularities(
                 k=new_k,
                 h=new_h,
                 phi=new_phi,
-                steps=ch.steps + [Step("blowup", detail, new_poly.as_expr(),
+                unit=new_unit,
+                steps=ch.steps + [Step("blowup", detail, new_poly,
                                        tuple(new_k), tuple(new_h),
                                        subs=tuple(sub.items()),
                                        center=tuple(gens[j] for j in J),
@@ -1336,6 +1415,8 @@ def _esc(t: str) -> str:
 
 
 def _short(expr, limit: int) -> str:
+    if isinstance(expr, sp.Poly):
+        expr = expr.as_expr()
     t = sp.sstr(expr)
     if limit and len(t) > limit:
         t = t[:limit - 3] + "..."
@@ -1589,7 +1670,6 @@ def _demo():
             with open(f"tree_{label}.dot", "w") as fh:
                 fh.write(res.to_dot())
             print(f"  {label}: tree_{label}.dot を書き出しました ({e})")
-        
 
     print("\n=== 解消できない場合は例外 " + "=" * 34)
     try:

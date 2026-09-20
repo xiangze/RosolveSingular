@@ -166,26 +166,100 @@ def _at_origin(expr, variables) -> sp.Expr:
     return sp.simplify(expr.subs({v: 0 for v in variables}))
 
 
-def _linear_reduce(gens: Sequence[sp.Expr]) -> List[sp.Expr]:
+def _linear_reduce(gens: Sequence[sp.Expr], vars_=None) -> List[sp.Expr]:
     """生成元を定数係数の線形結合で簡約する (イデアルは変わらない)。
 
-    データ点ごとの残差は互いに一次従属なことが多い (モデルの像の次元しか
-    独立な生成元がない)。単項式を基底とみなして行簡約すると、生成元の
-    本数がモデルの「関数空間の次元」まで落ちる。
+    実装は sympy の Matrix.rref ではなく、単項式を列とみなした疎な
+    掃き出しを Fraction で行う。rref は Expr 上の演算が重く、tanh の
+    展開のように項が増えると支配的なコストになるため。
     """
-    polys = [sp.expand(g) for g in gens if g != 0]
+    from fractions import Fraction
+
+    exprs = [g for g in gens if g != 0]
+    if not exprs:
+        return []
+    if vars_ is None:
+        vs = set()
+        for g in exprs:
+            vs |= g.free_symbols
+        vars_ = tuple(sorted(vs, key=str))
+    vars_ = tuple(vars_)
+
+    rows = []
+    for g in exprs:
+        try:
+            p = sp.Poly(sp.expand(g), *vars_)
+        except sp.PolynomialError:
+            return _linear_reduce_slow(exprs)
+        if p.is_zero:
+            continue
+        d = {}
+        try:
+            for mon, c in zip(p.monoms(), p.coeffs()):
+                r = sp.Rational(c)
+                d[tuple(mon)] = Fraction(int(r.p), int(r.q))
+        except (TypeError, ValueError):
+            # 係数が有理数でない (tanh(5/4) のような記号定数を含む) 場合は
+            # 従来の実装に落とす。有理数化しておくほうが桁で速い。
+            return _linear_reduce_slow(exprs)
+        rows.append(d)
+    if not rows:
+        return []
+
+    cols = sorted({m for d in rows for m in d})
+    order = {m: i for i, m in enumerate(cols)}
+
+    basis: Dict[int, dict] = {}
+    for r in rows:
+        r = {m: v for m, v in r.items() if v}
+        while r:
+            pi = min(order[m] for m in r)
+            pm = cols[pi]
+            if pi in basis:
+                b = basis[pi]
+                f = r[pm] / b[pm]
+                for m, v in b.items():
+                    nv = r.get(m, Fraction(0)) - f * v
+                    if nv:
+                        r[m] = nv
+                    else:
+                        r.pop(m, None)
+            else:
+                basis[pi] = r
+                break
+
+    out = []
+    for pi in sorted(basis):
+        r = basis[pi]
+        d = {m: sp.Rational(v.numerator, v.denominator)
+             for m, v in r.items() if v}
+        if not d:
+            continue
+        # 実測では Poly.from_dict().as_expr() より手で積み上げるほうが
+        # 速かった (expr_from_dict がプロファイル上で最も重い)。
+        e = sp.Integer(0)
+        for m, v in d.items():
+            e += v * sp.prod([x ** k for x, k in zip(vars_, m) if k])
+        out.append(e)
+    return out
+
+
+def _linear_reduce_slow(gens):
+    """多項式にできない場合のための従来実装 (sympy の rref)。"""
+    polys = [sp.expand(g) for g in gens if sp.expand(g) != 0]
     if not polys:
         return []
     monoms = sorted({m for p in polys for m in p.as_coefficients_dict()},
                     key=sp.default_sort_key)
-    M = sp.Matrix([[sp.nsimplify(p.as_coefficients_dict().get(m, 0)) for m in monoms]
-                   for p in polys])
+    M = sp.Matrix([[sp.nsimplify(p.as_coefficients_dict().get(m, 0))
+                    for m in monoms] for p in polys])
     R, _ = M.rref()
     out = []
     for i in range(R.rows):
         row = [R[i, j] for j in range(len(monoms))]
         if any(v != 0 for v in row):
-            out.append(sp.expand(sum(row[j] * monoms[j] for j in range(len(monoms)))))
+            out.append(sp.expand(sum(row[j] * monoms[j]
+                                     for j in range(len(monoms)))))
     return out
 
 
@@ -227,10 +301,19 @@ def _eliminate_regular(gens, variables, verbose=False):
     progress = True
     while progress and gens:
         progress = False
-        for gi, g in enumerate(gens):
-            zeros = {v: 0 for v in variables}
-            lin = {v: sp.simplify(sp.diff(g, v).subs(zeros)) for v in variables}
-            cand = [v for v in variables if lin[v] != 0]
+        # 各生成元の Poly を一度だけ作る。sp.simplify や subs を変数ごとに
+        # 呼ぶと assumption の推論 (deduce_all_facts) が支配的コストになる。
+        polys = []
+        for g in gens:
+            try:
+                polys.append(sp.Poly(g, *variables))
+            except sp.PolynomialError:
+                polys.append(None)
+        for gi, (g, P) in enumerate(zip(gens, polys)):
+            if P is None:
+                continue
+            # 原点での線形係数 = 単項式 v の係数
+            cand = [v for v in variables if P.coeff_monomial(v) != 0]
             if not cand:
                 continue
             for v in cand:
@@ -239,25 +322,41 @@ def _eliminate_regular(gens, variables, verbose=False):
                     continue
                 A = pg.coeff_monomial(v)
                 B = pg.coeff_monomial(1)
-                if sp.simplify(A.subs(zeros)) == 0:
+                if A == 0:
                     continue
                 sol = sp.cancel(-B / A)
+                others = [w for w in variables if w != v]
+                fast = A.is_number and others
                 new_gens = []
                 ok = True
                 for hj, h in enumerate(gens):
                     if hj == gi:
                         continue
-                    hh = sp.cancel(sp.together(h.subs(v, sol)))
-                    num, den = sp.fraction(hh)
-                    if sp.simplify(den.subs(zeros)) == 0:
-                        ok = False
-                        break
-                    num = sp.expand(num)          # den は原点で単元なので落としてよい
+                    num = None
+                    if fast:
+                        try:
+                            hp = sp.Poly(h, v)
+                            solp = sp.Poly(sp.expand(sol), *others)
+                            acc = sp.Poly(0, *others)
+                            for (e_,), c_ in zip(hp.monoms(), hp.coeffs()):
+                                acc = acc + sp.Poly(c_, *others) * solp ** e_
+                            num = acc.as_expr()
+                        except Exception:
+                            num = None
+                    if num is None:
+                        hh = sp.cancel(sp.together(h.subs(v, sol)))
+                        num, den = sp.fraction(hh)
+                        if den.subs({w: 0 for w in variables}) == 0:
+                            ok = False
+                            break
+                        num = sp.expand(num)
                     if num != 0:
                         new_gens.append(num)
                 if not ok:
                     continue
-                gens = _linear_reduce(new_gens)
+                # ループ内で毎回簡約する。外に出すと生成元が増えたまま
+                # 次の代入が走り、かえって遅くなる (実測で 15 -> 19 秒)。
+                gens = _linear_reduce(new_gens, variables)
                 variables = [w for w in variables if w != v]
                 eliminated.append(v)
                 if verbose:
@@ -308,7 +407,7 @@ def local_rlct_from_ideal(
         return LocalRLCT(rlct=sp.Integer(0), multiplicity=0, n_vars_initial=n0,
                          free_vars=variables, notes=notes)
 
-    gens = _linear_reduce(gens)
+    gens = _linear_reduce(gens, variables)
 
     # --- 自由方向 (K に現れない変数) を落とす ------------------------
     used = _used_vars(gens, variables)
@@ -324,7 +423,7 @@ def local_rlct_from_ideal(
     gauge_vars, _ = _gauge_fix(sym, variables)
     if gauge_vars:
         sub0 = {v: 0 for v in gauge_vars}
-        gens = _linear_reduce([sp.expand(g.subs(sub0)) for g in gens])
+        gens = _linear_reduce([sp.expand(g.subs(sub0)) for g in gens], variables)
         variables = [v for v in variables if v not in gauge_vars]
         # 固定後に使われなくなった変数も落とす
         used2 = _used_vars(gens, variables)
@@ -338,7 +437,7 @@ def local_rlct_from_ideal(
 
     # --- 正則方向の消去 ----------------------------------------------
     core_gens, core_vars, regular = _eliminate_regular(gens, variables, verbose=verbose)
-    core_gens = _linear_reduce(core_gens)
+    core_gens = _linear_reduce(core_gens, core_vars)
     lam_reg = sp.Rational(len(regular), 2)
 
     # 消去で使われなくなった変数を整理

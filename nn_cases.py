@@ -269,16 +269,29 @@ def run_case(c: NNCase, *, timeout_ms: int = 4000, max_depth: int = 8,
                  "arch": "-".join(map(str, c.widths)),
                  "degeneracy": c.degeneracy, "n_params": len(c.variables),
                  "taylor": c.taylor_order, "n_gens": len(c.generators)}
+    from timing import add_meta, last_record, record, timed
+
     t0 = time.time()
     signal.alarm(timeout_s)
+    _ctx = record(c.name, activation=c.activation, arch=rec["arch"],
+                  n_params=len(c.variables), n_gens=len(c.generators),
+                  taylor=c.taylor_order)
+    _ctx.__enter__()
+    _closed = False
     try:
-        loc = local_rlct_from_ideal(c.generators, c.variables,
-                                    symmetry_vectors=c.symmetries,
-                                    max_depth=max_depth)
+        with timed("nn_reduce+resolve"):
+            loc = local_rlct_from_ideal(c.generators, c.variables,
+                                        symmetry_vectors=c.symmetries,
+                                        max_depth=max_depth)
     except _TO:
+        _ctx.__exit__(None, None, None); _closed = True
+        rec["timing"] = last_record().as_dict() if last_record() else None
         rec.update(status="timeout", time=round(time.time() - t0, 1))
         return rec
     except Exception as e:                            # noqa: BLE001
+        if not _closed:
+            _ctx.__exit__(None, None, None); _closed = True
+        rec["timing"] = last_record().as_dict() if last_record() else None
         rec.update(status="error", note=str(e)[:60],
                    time=round(time.time() - t0, 1))
         return rec
@@ -287,15 +300,26 @@ def run_case(c: NNCase, *, timeout_ms: int = 4000, max_depth: int = 8,
     rec.update(free=len(loc.free_vars), gauge=len(loc.gauge_fixed),
                regular=len(loc.regular_vars), core=len(loc.core_vars),
                rlct=str(loc.rlct), mult=loc.multiplicity)
+    add_meta(core=len(loc.core_vars), regular=len(loc.regular_vars))
+    if loc.resolution is not None:
+        add_meta(n_charts=len(loc.resolution.charts),
+                 n_blowups=loc.resolution.n_blowups,
+                 n_newton=loc.resolution.n_newton)
+        rec["n_charts"] = len(loc.resolution.charts)
+        rec["n_newton"] = loc.resolution.n_newton
     # 証明書
+    rec["core_route"] = getattr(loc, "core_route", "")
     if loc.resolution is None:
-        rec["status"] = "proved"          # コアが空 = 正則方向だけで厳密
-        rec["cert"] = "core-empty"
+        rec["status"] = "proved"
+        # コアが空 (正則方向だけ) か、コア全体がニュートン非退化で厳密か
+        rec["cert"] = ("newton" if rec["core_route"] == "newton"
+                       else "core-empty")
     else:
         try:
             from certify import certify
             signal.alarm(timeout_s)
-            cert = certify(loc.resolution, timeout_ms=timeout_ms)
+            with timed("certify"):
+                cert = certify(loc.resolution, timeout_ms=timeout_ms)
             signal.alarm(0)
             rec["status"] = cert.status
             rec["cert"] = "certify"
@@ -303,6 +327,9 @@ def run_case(c: NNCase, *, timeout_ms: int = 4000, max_depth: int = 8,
             signal.alarm(0)
             rec["status"] = "unknown"
             rec["cert"] = f"error:{str(e)[:30]}"
+    if not _closed:
+        _ctx.__exit__(None, None, None)
+    rec["timing"] = last_record().as_dict() if last_record() else None
     rec["time"] = round(time.time() - t0, 1)
     return rec
 
@@ -345,6 +372,16 @@ def summarize(recs: List[Dict]) -> str:
         for k in sorted(by3, key=str):
             a, b = by3[k]
             L.append(f"    {str(k):<12} {a}/{b} proved ({100*a/b:5.1f}%)")
+
+    L.append("# 実行時間 (秒)")
+    try:
+        from timing import timing_summary
+        L.append(timing_summary(recs, by=("activation",)))
+        L.append(timing_summary(recs, by=("arch",)))
+        L.append(timing_summary(recs, by=("core",)))
+        L.append(timing_summary(recs, by=("n_params",)))
+    except Exception as e:                            # noqa: BLE001
+        L.append(f"    集計に失敗: {e}")
 
     L.append("# tanh のテイラー打ち切り次数で lambda が動くか")
     seen = collections.defaultdict(dict)

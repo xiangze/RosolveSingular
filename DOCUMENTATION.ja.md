@@ -164,6 +164,45 @@ res.to_lean("lean_out")
 これにより `x³+y⁴+z⁵` が 5 chart・0.07 秒で解けます (通常のブローアップでは
 何回反復しても止まりません)。
 
+#### chart ごとのニュートン高速パス (`newton_fast=True`, 既定)
+
+chart の局所ゼータは
+
+    Z(z) = ∫ |y^k · f_rest(y)|^z · |y^h| dy      (chart の原点近傍)
+
+なので、`P = y^k · f_rest` が原点で**実数体上ニュートン多面体に関して
+非退化**であれば、Varchenko の定理から λ は LP (振幅付きニュートン距離) で
+厳密に決まります。つまり **f_rest が単元になるまでブローアップを続ける必要が
+ありません**。各 chart で
+
+1. 凸包からコンパクト面を列挙
+2. 各面 σ について `∃y, (∀i) y_i ≠ 0 ∧ ∇P_σ(y) = 0` が UNSAT かを Z3 で判定
+3. すべて UNSAT なら `newton_rlct(P, h=h)` と `newton_multiplicity` で
+   (λ, m) を確定し、その chart を閉じる (`status='resolved(newton)'`)
+
+を行います。非退化を**証明できたときだけ**採用するので真値は変わりません
+(`bench/guards.py` の「Newton 高速パス不変」10 件が on/off の一致を常時監視)。
+
+中心の付け替え候補がある chart では使いません。高速パスが確定するのは
+chart の**原点**における値で、例外因子上の他の点は付け替え chart が
+担当するからです (単元で閉じる場合とまったく同じ扱い)。
+
+`newton_fast_max_terms` (既定 60)、`newton_fast_max_vars` (既定 24) を
+超える chart では、凸包と Z3 のコストが見合わないので判定しません。
+`newton_fast=False` で従来どおり単元まで解消します。
+
+`certify()` はこの葉を単元条件ではなく「非退化の再判定 + LP と位数の再計算」で
+検査します (解消側のキャッシュを信用しない)。食い違えば `refuted`。
+Varchenko の定理自体は (h) Watanabe の定理と同様、前提として仮定します
+(Lean 側は `newton_*` として `sorry` 相当で出力)。
+
+計測 (ランダム多項式 54 本、n=2..4, d=3..5):
+
+| | 合計時間 | 中央値 | chart 合計 | 解消成功 |
+|---|---|---|---|---|
+| `newton_fast=False` | 14.7s | 0.062s | 302 | 46/54 |
+| `newton_fast=True` | 6.0s | 0.019s | 146 | 49/54 |
+
 #### 分枝限定 (`prune=True` / `'ties'`)
 
 λ は全 chart の最小値なので、最小化問題として枝刈りできます。
@@ -398,6 +437,51 @@ rep.print_report()
 - `zero_tol` で小さい重みを 0 に丸めます。丸めないとほぼ必ず正則点になります
 - `targets` は θ\* が realizable な点かの検査にだけ使い、fiber ideal は常に
   「θ\* のモデルが真」として作ります
+
+### 4.7.5 `timing.py` — 段階別の実行時間
+
+多項式・ネットワークのサイズや次数と計算時間の関係を測るための軽量
+プロファイラです。スレッドローカルなので並列に回しても混ざりません。
+
+```python
+from timing import record, timed, last_record, timing_summary
+
+with record("case-1", n_vars=4, degree=6):
+    with timed("resolve"):
+        res = resolve_singularities(f, gens)
+    with timed("certify"):
+        cert = certify(res)
+rec = last_record()
+rec.phases      # {'resolve': 1.23, 'certify': 0.31}  (ネスト込みの経過)
+rec.exclusive   # 自分だけの時間 (二重計上しない)
+rec.counts      # 呼び出し回数
+rec.as_dict()   # JSON に落とせる形
+```
+
+段階名は固定です: `family` / `newton` / `newton_chart` / `ideal` /
+`resolve` / `certify` / `eliminate_regular` / `nn_reduce+resolve` / `lp` / `smt`。
+
+`certify.rlct_certified()` は内部で `record()` を開いているので、呼んだ後に
+`timing.last_record()` で内訳が取れます。
+
+```
+>>> rlct_certified((x*y + z**2)**2, (x, y, z))
+(1/2, 'proved', 'blowup+certify')
+>>> print(timing.last_record())
+rlct_certified: wall=0.248s [resolve=0.157s, ideal=0.046s, certify=0.022s,
+                             newton=0.008s, newton_chart=0.003s]
+```
+
+`bench/run.py` と `bench/nn_cases.py` は各レコードに `time`
+(ケース全体の秒数) と `timing` (段階別の内訳・共変量) を書き出し、
+`bench/report.py` / `nn_cases.summarize()` / `bench/regression.py` が
+`timing_summary()` で変数の数・次数・アーキテクチャ別に集計します。
+
+```
+# 実行時間 (秒): (変数, 次数) ごと
+n_vars / degree       n    median      mean       max  内訳 (中央値)
+(4, 4)               19     0.060     2.258    36.510  resolve=0.42, certify=0.03, ...
+```
 
 ### 4.8 `bench/` — 逐次改善の土台
 

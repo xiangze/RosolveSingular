@@ -170,6 +170,47 @@ chart splits into two with sign `s = ±1`.
 This resolves `x³+y⁴+z⁵` in 5 charts and 0.07 s; plain blow-ups never terminate
 on it.
 
+#### Per-chart Newton fast path (`newton_fast=True`, default)
+
+The local zeta function of a chart is
+
+    Z(z) = ∫ |y^k · f_rest(y)|^z · |y^h| dy      (near the chart's origin)
+
+so if `P = y^k · f_rest` is **nondegenerate over ℝ with respect to its Newton
+polyhedron** at the origin, Varchenko's theorem fixes λ exactly as an LP (the
+Newton distance with amplitude `h`). In that case there is **no need to keep
+blowing up until `f_rest` becomes a unit**. For each chart:
+
+1. enumerate the compact faces of the Newton polyhedron (convex hull);
+2. for each face σ, ask z3 whether `∃y, (∀i) y_i ≠ 0 ∧ ∇P_σ(y) = 0` is UNSAT;
+3. if all faces are UNSAT, close the chart with `newton_rlct(P, h=h)` and
+   `newton_multiplicity` (`status='resolved(newton)'`).
+
+The value is adopted **only when nondegeneracy is proved**, so the answer never
+changes; `bench/guards.py` runs 10 on/off agreement checks ("Newton 高速パス不変")
+on every run.
+
+The fast path is skipped on charts that have recentring candidates: like the
+unit-termination case it fixes the value at the chart's **origin**, and other
+points of the exceptional divisor belong to the recentred charts.
+
+Charts with more than `newton_fast_max_terms` (60) monomials or
+`newton_fast_max_vars` (24) variables are not tested — the hull and z3 cost
+stops paying off. `newton_fast=False` restores the old behaviour.
+
+`certify()` checks such a leaf by **re-deciding nondegeneracy and recomputing
+the LP value and the multiplicity** rather than by the unit condition (it does
+not trust the resolver's cache); a mismatch is `refuted`. Varchenko's theorem
+itself is assumed, like (h) Watanabe's theorem, and is emitted as a `newton_*`
+placeholder on the Lean side.
+
+Measured on 54 random polynomials (n = 2..4, d = 3..5):
+
+| | total | median | charts | resolved |
+|---|---|---|---|---|
+| `newton_fast=False` | 14.7s | 0.062s | 302 | 46/54 |
+| `newton_fast=True` | 6.0s | 0.019s | 146 | 49/54 |
+
 #### Branch and bound (`prune=True` / `'ties'`)
 
 λ is a minimum over charts, so pruning is legitimate.
@@ -409,6 +450,46 @@ rep.print_report()
   always regular
 - `targets` is only used to verify θ\* is realizable; the fibre ideal is always
   built treating the model at θ\* as the truth
+
+### 4.7.5 `timing.py` — phase-level timing
+
+A small thread-local profiler used to relate runtime to polynomial /
+network size and degree.
+
+```python
+from timing import record, timed, last_record, timing_summary
+
+with record("case-1", n_vars=4, degree=6):
+    with timed("resolve"):
+        res = resolve_singularities(f, gens)
+    with timed("certify"):
+        cert = certify(res)
+rec = last_record()
+rec.phases      # elapsed per phase (nested included)
+rec.exclusive   # self time only (no double counting)
+rec.counts      # call counts
+rec.as_dict()   # JSON-serialisable
+```
+
+Phase names are fixed: `family`, `newton`, `newton_chart`, `ideal`,
+`resolve`, `certify`, `eliminate_regular`, `nn_reduce+resolve`, `lp`, `smt`.
+
+`certify.rlct_certified()` opens a record internally, so
+`timing.last_record()` gives the breakdown after a call:
+
+```
+>>> rlct_certified((x*y + z**2)**2, (x, y, z))
+(1/2, 'proved', 'blowup+certify')
+>>> print(timing.last_record())
+rlct_certified: wall=0.248s [resolve=0.157s, ideal=0.046s, certify=0.022s,
+                             newton=0.008s, newton_chart=0.003s]
+```
+
+`bench/run.py` and `bench/nn_cases.py` store `time` (whole case) and
+`timing` (phase breakdown plus covariates) on every record;
+`bench/report.py`, `nn_cases.summarize()` and `bench/regression.py`
+aggregate them with `timing_summary()` by variable count, degree,
+architecture and activation.
 
 ### 4.8 `bench/` — the improvement loop
 

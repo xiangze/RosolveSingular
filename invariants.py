@@ -287,6 +287,10 @@ def milnor_number(f, gens=None, *, use_formula: bool = True,
     Singular は局所順序 (ds) を使えるので、原点だけの mu が得られる。
     sympy 経路は大域的な sum_p mu_p になることに注意。
 
+    use_formula は擬斉次の公式との突き合わせに使う。公式は複素数体上で
+    孤立している場合にのみ有効で、ゼロ次元性の判定 (グレブナー基底の
+    主導単項式に各変数の純冪が現れるか) が先に立つ。
+
     Returns (mu, route)
     """
     f = sp.expand(sp.sympify(f))
@@ -301,19 +305,23 @@ def milnor_number(f, gens=None, *, use_formula: bool = True,
             raise RuntimeError("Singular を呼び出せませんでした "
                                "(apt install singular などで導入してください)")
 
-    if use_formula:
-        qh = quasihomogeneous_weights(f, gens)
-        # 公式 mu = prod (d/w_i - 1) は「孤立」特異点でのみ成り立つ。
-        # (x-y)^2 のように擬斉次でも非孤立な例があるので必ず確認する。
-        if qh and _isolated_at_origin(f, gens) == "proved":
-            w, d = qh
-            mu = sp.prod([sp.Rational(d, wi) - 1 for wi in w])
-            if mu.is_Integer and mu >= 0:
-                return (int(mu), f"擬斉次の公式 (w={w}, d={d}, 孤立性を確認)")
     jac = [sp.diff(f, v) for v in gens]
     dim = _quotient_dimension(jac, gens)
+    qh = quasihomogeneous_weights(f, gens) if use_formula else None
     if dim is None:
-        return (sp.oo, "ヤコビアンイデアルがゼロ次元でない (孤立特異点でない)")
+        # ヤコビアンイデアルがゼロ次元でない = 複素数体上で孤立していない。
+        # 擬斉次の公式はこの場合には使えない ((x^2+y^2)^2 が実例: 実点では
+        # 原点しか特異でないが、複素では x = +-i y に沿って特異なので
+        # mu = oo が正しい)。実数上の孤立性判定では不十分。
+        return (sp.oo, "ヤコビアンイデアルがゼロ次元でない "
+                       "(複素数体上で孤立特異点でない)")
+    if qh:
+        w, d = qh
+        mu = sp.prod([sp.Rational(d, wi) - 1 for wi in w])
+        if mu.is_Integer and int(mu) != dim:
+            return (dim, f"グレブナー基底 (大域) / 擬斉次の公式は {mu} で不一致")
+        if mu.is_Integer:
+            return (dim, f"グレブナー基底 (大域) = 擬斉次の公式 (w={w}, d={d})")
     return (dim, "グレブナー基底 (大域)")
 
 

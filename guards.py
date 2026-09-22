@@ -185,7 +185,7 @@ def independent_tests() -> List[GuardResult]:
 
 def aoyagi_lemma_tests() -> List[GuardResult]:
     """Aoyagi の補題 (真値を使わない関係式) が成り立つか。"""
-    from aoyagi_lemmas import (deepest_point_disagrees,
+    from guards import (deepest_point_disagrees,
                                ideal_invariance_disagrees,
                                monotonicity_disagrees, separation_disagrees)
     x, y, z = sp.symbols("x y z", real=True)

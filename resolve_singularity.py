@@ -224,6 +224,15 @@ except Exception:      # pragma: no cover
     _linprog = None
     _HAS_SCIPY = False
 
+try:
+    from timing import timed as _timed
+except Exception:      # pragma: no cover
+    from contextlib import contextmanager as _cm
+
+    @_cm
+    def _timed(_name):           # 計時モジュールが無くても動く
+        yield
+
 
 def _pick_backend(backend: str, hot: bool = False) -> str:
     """'pulp' / 'scipy' / 'auto' を実際のバックエンド名に解決する。
@@ -401,6 +410,9 @@ class Chart:
     status: str = "internal"        # 'resolved'|'pruned'|'blowup'|'coordchg'|'recenter'|'failed'
     entry: int = 0                  # 親から引き継いだ steps の本数 (自分の steps はこれ以降)
     note: str = ""                  # 枝刈りの理由など (木の描画用)
+    closed: Optional[Tuple[sp.Rational, int, str]] = None
+    # closed = (lambda, m, 根拠) : 単元にしないまま値を確定させた chart。
+    # いまのところ根拠は 'newton' (Varchenko の定理) のみ。
 
     def own_steps(self) -> List[Step]:
         """この chart で行われた変形だけを取り出す。"""
@@ -434,7 +446,13 @@ class Chart:
         return sp.prod([v ** e for v, e in zip(self.gens, self.h)])
 
     def local_rlct(self) -> Tuple[sp.Rational, int]:
-        """この chart の (lambda, 位数)。k がすべて 0 なら (oo, 0)。"""
+        """この chart の (lambda, 位数)。k がすべて 0 なら (oo, 0)。
+
+        ニュートン高速パスで閉じた chart は、そこで求めた厳密値を返す
+        (f_rest が単元でなくても Varchenko の定理から値が確定している)。
+        """
+        if self.closed is not None:
+            return (self.closed[0], self.closed[1])
         cand = [
             (sp.Rational(hj + 1, kj), j)
             for j, (kj, hj) in enumerate(zip(self.k, self.h))
@@ -472,6 +490,9 @@ class Resolution:
     n_blowups: int
     n_pruned: int = 0
     n_lp: int = 0
+    n_newton: int = 0          # ニュートン高速パスで閉じた chart 数
+    n_newton_tests: int = 0    # 非退化を試した chart 数
+    n_product: int = 0         # 積の分解で閉じた chart 数
     warnings: List[str] = field(default_factory=list)
     nodes: Dict[str, "Chart"] = field(default_factory=dict)
 
@@ -510,7 +531,10 @@ class Resolution:
             f"# f = {self.f}",
             f"# 変数: {list(self.gens)}",
             f"# chart 数: {len(self.charts)},  ブローアップ回数: {self.n_blowups},"
-            f"  枝刈り: {self.n_pruned},  LP 呼び出し: {self.n_lp}",
+            f"  枝刈り: {self.n_pruned},  LP 呼び出し: {self.n_lp}"
+            + (f",  Newton 打ち切り: {self.n_newton}/{self.n_newton_tests}"
+               if self.n_newton_tests else "")
+            + (f",  積の分解: {self.n_product}" if self.n_product else ""),
             f"# RLCT lambda = {self.rlct}  (= {sp.nsimplify(self.rlct)}"
             + (f" ~ {float(self.rlct):.6f}" if self.rlct.is_Number and self.rlct.is_finite else "")
             + f"),  位数 m = {self.multiplicity}",
@@ -775,6 +799,67 @@ def _chart_upper_bound(k: Sequence[int], p: sp.Poly, h: Sequence[int],
 
 
 # ----------------------------------------------------------------------
+# chart ごとのニュートン高速パス (Varchenko の定理)
+# ----------------------------------------------------------------------
+def _chart_newton_close(k: Sequence[int], p: sp.Poly, h: Sequence[int],
+                        gens: Sequence[sp.Symbol], *, backend: str,
+                        timeout_ms: int, cache: dict):
+    """chart の局所データが原点でニュートン非退化なら (lambda, m) を確定する。
+
+    chart の局所ゼータは
+
+        Z(z) = ∫ |y^k f_rest(y)|^z |y^h| dy       (原点近傍)
+
+    なので、P = y^k * f_rest が原点でニュートン多面体に関して (実数体上で)
+    非退化なら、Varchenko の定理から lambda は P の「振幅付きニュートン
+    距離」で厳密に決まる。つまり **そこで打ち切ってよい**。
+    これはブローアップを続けて単元に到達するのを待つより桁違いに速い
+    (LP + 有限個の Z3 判定だけで済む)。
+
+    注意: これは chart の**原点**における値である。例外因子上の原点以外に
+    非正規交差点が残りうる点は単元で閉じる場合とまったく同じで、そちらは
+    中心の付け替え (recenter) が担当する。したがって呼び出し側は
+    「付け替え候補が無い」ときにだけこの経路を使う。
+
+    Returns (lambda, m) または None (非退化を示せなかった)。
+    """
+    key = (tuple(k), tuple(h), tuple(p.monoms()), tuple(map(str, p.coeffs())))
+    if key in cache:
+        return cache[key]
+
+    monoms = [tuple(ki + ei for ki, ei in zip(k, m)) for m in p.monoms()]
+    # 原点で消えていない (定数項がある) なら単元扱いの話で、ここでは扱わない。
+    if any(all(e == 0 for e in m) for m in monoms):
+        cache[key] = None
+        return None
+
+    result = None
+    try:
+        from certify import (newton_nondegenerate, newton_multiplicity,
+                             principal_face_compact)
+        P = sum(c * sp.prod([v ** e for v, e in zip(gens, m)])
+                for c, m in zip(p.coeffs(), monoms))
+        st, _face = newton_nondegenerate(P, gens, timeout_ms=timeout_ms)
+        if st == "proved":
+            val = _lp_newton_value(monoms, [hj + 1 for hj in h],
+                                   backend=backend, hot=True)
+            if val != float("inf") and val > 0:
+                lam = sp.Rational(val).limit_denominator(10 ** 6)
+                # LP は浮動小数で返る (CBC は有効数字 8 桁程度)。有理数に
+                # 戻せていなければ厳密値として採用しない。
+                # 非退化だけでは足りない: 主面がコンパクトであること
+                if (abs(float(lam) - val) <= 1e-7 * max(1.0, val)
+                        and principal_face_compact(
+                            monoms, [hj + 1 for hj in h], lam) is True):
+                    m_ = newton_multiplicity(P, gens, h=list(h))
+                    result = (lam, int(m_) if m_ else 1)
+    except Exception:
+        result = None
+    cache[key] = result
+    return result
+
+
+# ----------------------------------------------------------------------
 # 例外因子上の非正規交差点の探索 (中心の付け替え)
 # ----------------------------------------------------------------------
 def _offorigin_centers(chart: Chart, max_solutions: int = 4):
@@ -992,6 +1077,12 @@ def resolve_singularities(
     lp_backend: str = "auto",
     keep_tree: bool = True,
     max_tree_nodes: int = 3000,
+    newton_fast: bool = True,
+    newton_timeout_ms: int = 4000,
+    newton_fast_max_terms: int = 60,
+    newton_fast_max_vars: int = 24,
+    product_split: bool = True,
+    lower_bound=None,
     verbose: bool = False,
 ) -> Resolution:
     """多項式 f の原点における特異点をブローアップの反復で解消する。
@@ -1049,6 +1140,30 @@ def resolve_singularities(
         LP/ILP のバックエンド。'pulp' は CBC などの外部ソルバーを呼ぶ。
         'auto' は探索ループ内では in-process の scipy(HiGHS)、単発の
         呼び出し (newton_rlct, 中心の整数計画) では pulp を優先する。
+    newton_fast : bool
+        chart ごとにニュートン非退化を判定し、非退化と分かった時点で
+        Varchenko の定理で lambda を確定して打ち切る (既定で有効)。
+        単元に到達するまでブローアップを続けるより速く、変数が多いほど
+        効果が大きい。newton_fast=False で従来どおり単元まで解消する。
+        判定は LP + 有限個の Z3 充足不能判定で、真値を変えない
+        (非退化を「証明できたとき」だけ採用する)。
+    newton_timeout_ms : int
+        1 面あたりの Z3 の打ち切り時間。
+    newton_fast_max_terms, newton_fast_max_vars : int
+        高速パスを試す上限 (これを超える chart では凸包・Z3 のコストが
+        見合わないので判定しない)。
+    product_split : bool
+        chart の残差 f_rest が **変数の互いに素な因子**の積に分かれるとき、
+        局所データ (y^k f_rest, y^h) の積分が完全に分離することを使って
+        lambda = min(部分問題の lambda)、位数 = 最小を与える側の和として
+        その chart を閉じる (既定で有効)。k, h が何であっても成り立つので
+        木のどのノードでも使える (lemmas.py の解説を参照)。
+    lower_bound : Rational or None
+        lambda の**厳密な大域下界**が分かっているとき渡す
+        (例: Aoyagi Lemma 1(1) から得た部分生成元の値、lemmas.py)。
+        到達値がこの下界に達したら、どの枝もそれより小さくできないので
+        探索を打ち切る。lambda は厳密なままだが、打ち切った時点で
+        位数 m は**下限**になりうる (prune='ties' と同じ扱い)。
     recenter : bool or None
         例外因子上の原点以外の非正規交差点を探して中心を付け替えるか。
         None なら変数が recenter_max_vars 以下のときのみ有効。
@@ -1091,6 +1206,13 @@ def resolve_singularities(
     if keep_tree:
         nodes[root.name] = root
     ub_cache: dict = {}
+    nd_cache: dict = {}
+    ps_cache: dict = {}
+    n_newton = 0              # ニュートン高速パスで閉じた chart 数
+    n_newton_tests = 0
+    n_product = 0             # 積の分解で閉じた chart 数
+    lb_global = (sp.nsimplify(lower_bound) if lower_bound is not None else None)
+    lb_stopped = False
     bound = float("inf")      # 大域 lambda の上界 (LP 上界 or 到達値)
     achieved = float("inf")   # 実際に解消済み chart が到達した最小値
     ties_pruned = False
@@ -1101,6 +1223,21 @@ def resolve_singularities(
         warnings.append("LP ソルバー (pulp / scipy) が無いため枝刈りを無効化しました。")
 
     while stack:
+        # 大域下界に到達したら、どの枝もそれより小さくできないので打ち切る。
+        # (Aoyagi Lemma 1(1): 部分生成元の lambda <= 全体の lambda)
+        if lb_global is not None and achieved <= float(lb_global) * (1 + 1e-12):
+            lb_stopped = True
+            for rest in stack:
+                rest.status = "pruned"
+                rest.note = f"大域下界 {lb_global} に到達したので打ち切り"
+                if keep_tree and len(nodes) < max_tree_nodes:
+                    nodes[rest.name] = rest
+            n_pruned += len(stack)
+            if verbose:
+                print(f"  [lb-stop] 到達値 {achieved} = 大域下界 {lb_global}: "
+                      f"残り {len(stack)} chart を打ち切り")
+            break
+
         ch = stack.pop()
         if keep_tree and len(nodes) < max_tree_nodes:
             nodes[ch.name] = ch
@@ -1170,6 +1307,70 @@ def resolve_singularities(
         if recenter and n <= recenter_max_vars:
             for idx, pt in enumerate(_offorigin_centers(ch)):
                 recentered.append(_recenter(ch, pt, f"{ch.name}r{idx}"))
+
+        # ---- 2.5 ニュートン高速パス -------------------------------
+        # f_rest が単元でなくても、局所データ y^k*f_rest が原点で
+        # ニュートン非退化なら Varchenko の定理で lambda が厳密に決まる。
+        # そこで打ち切れば、単元に到達するまでブローアップを繰り返す必要が
+        # 無くなる (変数が増えるほど効く)。
+        # 付け替え候補があるときは使わない: 原点以外の寄与を取りこぼすため。
+        if (not unit and newton_fast and not recentered
+                and len(ch.poly.monoms()) <= newton_fast_max_terms
+                and n <= newton_fast_max_vars):
+            with _timed("newton_chart"):
+                nv = _chart_newton_close(ch.k, ch.poly, ch.h, gens,
+                                         backend=lp_backend,
+                                         timeout_ms=newton_timeout_ms,
+                                         cache=nd_cache)
+            n_newton_tests += 1
+            if nv is not None:
+                lam_c, m_c = nv
+                ch.closed = (lam_c, m_c, "newton")
+                ch.resolved = True
+                ch.status = "resolved(newton)"
+                ch.note = f"Newton 非退化: lambda={lam_c}, m={m_c}"
+                ch.steps.append(
+                    Step("newton", f"ニュートン非退化 -> lambda = {lam_c} (厳密)",
+                         ch.poly, tuple(ch.k), tuple(ch.h))
+                )
+                done.append(ch)
+                n_newton += 1
+                achieved = min(achieved, float(lam_c))
+                bound = min(bound, float(lam_c))
+                if verbose:
+                    print(f"  [newton]   {ch.name}: lambda={lam_c}, m={m_c} "
+                          f"(非退化なので打ち切り)")
+                continue
+
+        # ---- 2.6 積の分解 -----------------------------------------
+        # f_rest が変数の互いに素な因子に分かれるなら、局所データの積分が
+        # 完全に分離するので、部分問題の値から (lambda, m) が決まる。
+        # k, h が何であっても正しいので、木のどのノードでも使える。
+        if not unit and product_split and not recentered and n <= 24:
+            with _timed("product_split"):
+                try:
+                    from lemmas import product_split_value
+                    pv = product_split_value(ch.k, ch.poly, ch.h, gens,
+                                             cache=ps_cache)
+                except Exception:
+                    pv = None
+            if pv is not None:
+                lam_c, m_c = pv
+                ch.closed = (lam_c, m_c, "product")
+                ch.resolved = True
+                ch.status = "resolved(product)"
+                ch.note = f"変数が互いに素な因子の積: lambda={lam_c}, m={m_c}"
+                ch.steps.append(
+                    Step("product", f"互いに素な因子に分解 -> lambda = {lam_c}",
+                         ch.poly, tuple(ch.k), tuple(ch.h))
+                )
+                done.append(ch)
+                n_product += 1
+                achieved = min(achieved, float(lam_c))
+                bound = min(bound, float(lam_c))
+                if verbose:
+                    print(f"  [product]  {ch.name}: lambda={lam_c}, m={m_c}")
+                continue
 
         # ---- 3. 原点で単元 -> この chart は解消済み -----------------
         # 付け替え候補があっても、原点近傍の寄与は正当なので done に入れる
@@ -1366,6 +1567,11 @@ def resolve_singularities(
     if lam is sp.oo:
         warnings.append("f は原点で消えていません (lambda = oo)。")
 
+    if lb_stopped:
+        warnings.append(
+            f"大域下界 {lb_global} に到達した時点で探索を打ち切りました。"
+            "lambda は厳密ですが、位数 m は下限 (真の値以下) の可能性があります。"
+        )
     if ties_pruned:
         warnings.append(
             "prune='ties': 同値の部分木を枝刈りしました。lambda は正しいですが、"
@@ -1386,6 +1592,9 @@ def resolve_singularities(
         n_blowups=n_blowups,
         n_pruned=n_pruned,
         n_lp=n_lp,
+        n_newton=n_newton,
+        n_newton_tests=n_newton_tests,
+        n_product=n_product,
         warnings=warnings,
         nodes=nodes,
     )
@@ -1397,6 +1606,8 @@ def resolve_singularities(
 _STATUS_STYLE = {
     "resolved": ("#d8f0d8", "解消済み"),
     "resolved+recenter": ("#d8f0d8", "解消済み + 付け替え"),
+    "resolved(newton)": ("#cde8f7", "Newton 非退化で打ち切り"),
+    "resolved(product)": ("#cdf7e8", "互いに素な因子の積に分解"),
     "pruned":   ("#e6e6e6", "枝刈り"),
     "failed":   ("#f7cccc", "未解消"),
     "blowup":   ("#ffffff", "ブローアップ"),

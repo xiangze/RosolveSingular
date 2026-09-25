@@ -81,7 +81,24 @@ __all__ = ["Certificate", "LeafCertificate", "certify", "Box",
            "RLCTInterval", "rlct_interval",
            "nonzero_on_box", "normal_crossing_on_box",
            "newton_nondegenerate", "rlct_via_newton", "newton_faces",
-           "newton_multiplicity"]
+           "newton_multiplicity", "principal_face_compact"]
+
+try:
+    from timing import timed as _timed, add_meta as _add_meta, record as _record
+except Exception:      # pragma: no cover
+    from contextlib import contextmanager as _cm
+
+    @_cm
+    def _timed(_name):
+        yield
+
+    @_cm
+    def _record(_label="", **_kw):
+        yield None
+
+    def _add_meta(**_kw):
+        pass
+
 
 try:
     import z3 as _z3
@@ -301,17 +318,50 @@ def normal_crossing_on_box(u, k, h, gens, box: Box, *,
 # ----------------------------------------------------------------------
 # ニュートン多面体の非退化性 (実数体上) と、その場合の厳密な RLCT
 # ----------------------------------------------------------------------
+def _used_coords(monoms):
+    """どの単項式にも現れない変数の位置を落とす。
+
+    f に現れない変数 x_j の方向には Gamma_+ が筒になっているので、
+    その空間ではコンパクトなファセットが 1 枚も存在せず、凸包を取っても
+    「全成分が負の法線」が得られない (実測: 53*x0*x2^3 + 61*x1^3*x2 を
+    4 変数で渡すと法線が空になり、非退化判定が unknown に落ちて、
+    そのまま解消が無限反復していた)。使われている座標だけに落として
+    計算し、法線は残りの成分を 0 にして戻す。
+    """
+    n = len(monoms[0])
+    used = [j for j in range(n) if any(m[j] for m in monoms)]
+    return used
+
+
 def newton_facet_normals(monoms, max_facets: int = 14):
-    """Newton(f) = conv(A) + R^n_+ のコンパクトなファセットの法線 w > 0。
+    """Newton(f) = conv(A) + R^n_+ のコンパクトなファセットの法線。
 
     A に各座標方向への十分長いオフセットを足した点集合の凸包を取り、
-    外向き法線が全成分負のファセットだけを拾う。
+    外向き法線が全成分負のファセットだけを拾う。f に現れない変数は
+    先に落として計算し、その成分は 0 として戻す (筒方向)。
     """
     try:
         import numpy as np
         from scipy.spatial import ConvexHull
     except Exception:
         return None
+    monoms = [tuple(m) for m in monoms]
+    n_full = len(monoms[0])
+    used = _used_coords(monoms)
+    if not used:
+        return None
+    if len(used) < n_full:
+        sub = [tuple(m[j] for j in used) for m in monoms]
+        inner = newton_facet_normals(sub, max_facets)
+        if inner is None:
+            return None
+        out = []
+        for w in inner:
+            full = [0] * n_full
+            for j, v in zip(used, w):
+                full[j] = v
+            out.append(full)
+        return out
     A = np.array([list(m) for m in monoms], dtype=float)
     n = A.shape[1]
     if n == 1:
@@ -346,27 +396,139 @@ def newton_facet_normals(monoms, max_facets: int = 14):
     return out[:max_facets]
 
 
-def newton_faces(monoms, max_facets: int = 12):
-    """コンパクトな面 (facet の交わり) をすべて列挙する。
+def _faces_by_lp(minimal, n):
+    """極小な単項式の部分集合を線形計画で篩って、コンパクトな面を列挙する。
 
-    法線扇の錐は facet 法線の正結合なので、facet 法線の部分集合の和を
-    重みに取って argmin を見れば全ての面が得られる。
+    `minimal` は成分ごとの順序についての反鎖 (支配される点は除去済み)。
+    部分集合ごとに 1 回の LP なので 2^|minimal| 回。|minimal| が小さい
+    (= 台が薄い) ときだけ使う。scipy が無ければ None。
     """
+    try:
+        from scipy.optimize import linprog
+    except Exception:
+        return None
+    import itertools
+
+    V = list(minimal)
+    N = len(V)
+    faces = []
+    for size in range(N, 1, -1):          # 大きい面から
+        for S in itertools.combinations(range(N), size):
+            sub = set(S)
+            sigma = [V[i] for i in S]
+            rest = [V[i] for i in range(N) if i not in sub]
+            # 変数 (w_0..w_{n-1}, d)
+            A_eq, b_eq = [], []
+            base = sigma[0]
+            for m in sigma[1:]:
+                A_eq.append([float(a - b) for a, b in zip(m, base)] + [0.0])
+                b_eq.append(0.0)
+            A_ub, b_ub = [], []
+            for m in rest:
+                # <w,m> >= <w,base> + 1   <=>   -(m - base).w <= -1
+                A_ub.append([-float(a - b) for a, b in zip(m, base)] + [0.0])
+                b_ub.append(-1.0)
+            res = linprog(c=[0.0] * (n + 1),
+                          A_ub=A_ub or None, b_ub=b_ub or None,
+                          A_eq=A_eq or None, b_eq=b_eq or None,
+                          bounds=[(1, None)] * n + [(None, None)])
+            if res.status == 0:
+                faces.append(tuple(sigma))
+    if not faces:
+        return None
+    return faces
+
+
+def newton_faces(monoms, max_facets: int = 12, max_faces: int = 600):
+    """Gamma_+(f) の**コンパクトな面をすべて**列挙する。
+
+    Varchenko の非退化条件はコンパクトな**面すべて**についての条件であり、
+    ファセットだけを見るのでは足りない。
+
+    >>> f = (x + y^2)^2 + z^2 = x^2 + 2x y^2 + y^4 + z^2
+    コンパクトなファセットは 1 枚 (法線 (2,1,2)) だけで、その上では
+    grad f_sigma = 0 が z != 0 と両立しないので「非退化」に見える。
+    しかし辺 {(2,0,0), (1,2,0), (0,4,0)} もコンパクトな面で、その面多項式
+    (x+y^2)^2 はトーラス上 x = -y^2 で勾配が消える。実際 lambda は 1 で、
+    ファセットだけを見て得られる 5/4 は誤り。
+
+    正しい列挙 — 多面体 P の面について face(w1 + w2) = face(w1) ∩ face(w2)
+    (交わりが空でないとき) が成り立つので、Gamma_+ の面は
+
+        face(w) = ∩_{i in S} face(n_i) ∩ ∩_{j in T} face(e_j)
+
+    (n_i はコンパクトなファセット法線、face(e_j) = {m : m_j が最小})
+    の形で尽くされる。w > 0 になるのは **S が空でないとき**で、それが
+    コンパクトな面にあたる。したがって「コンパクトなファセットの面から
+    始めて、他のファセット面・座標面との交わりで閉じる」だけでよい。
+
+    面の数が max_faces を超えたら None を返す (呼び出し側は 'unknown')。
+    """
+    monoms = [tuple(m) for m in monoms]
+    n = len(monoms[0])
+
+    key = (tuple(monoms), max_facets, max_faces)
+    if key in _FACE_CACHE:
+        return _FACE_CACHE[key]
+    out = _newton_faces_uncached(monoms, n, max_facets, max_faces)
+    if len(_FACE_CACHE) < 4096:
+        _FACE_CACHE[key] = out
+    return out
+
+
+_FACE_CACHE: Dict[tuple, object] = {}
+
+
+def _newton_faces_uncached(monoms, n, max_facets, max_faces):
+    # --- 台が薄いとき: 部分集合を直接 LP で判定する ------------------
+    # w > 0 に対する argmin 集合が「コンパクトな面」の定義そのものなので、
+    # sigma が面かどうかは線形計画の可解性で決まる:
+    #     exists w, d :  <w,m> = d (m in sigma),
+    #                    <w,m> >= d + 1 (m not in sigma),  w_j >= 1
+    # (w と d は正のスケールで自由なので、この正規化は一般性を失わない)
+    # 支配される単項式 (m' >= m が成分ごとに成り立つもの) は w > 0 では
+    # 決して argmin に入らないので、先に落としておく。
+    # まずは凸包から得たファセット法線で閉じる (速い)。台が薄くて
+    # コンパクトなファセットが 1 枚も無いときだけ LP の全列挙に落ちる。
     normals = newton_facet_normals(monoms, max_facets)
     if not normals:
+        minimal = [m for m in monoms
+                   if not any(m2 != m and all(a <= b for a, b in zip(m2, m))
+                              for m2 in monoms)]
+        if 2 <= len(minimal) <= 12:
+            return _faces_by_lp(minimal, n)
         return None
-    monoms = [tuple(m) for m in monoms]
-    faces = []
-    import itertools
-    r = min(len(normals), max_facets)
-    for size in range(1, r + 1):
-        for S in itertools.combinations(range(r), size):
-            w = [sum(normals[i][j] for i in S) for j in range(len(monoms[0]))]
-            d = min(sum(wj * e for wj, e in zip(w, m)) for m in monoms)
-            face = tuple(m for m in monoms
-                         if sum(wj * e for wj, e in zip(w, m)) == d)
-            if face not in faces:
-                faces.append(face)
+
+    def argmin(w):
+        d = min(sum(wj * e for wj, e in zip(w, m)) for m in monoms)
+        return tuple(m for m in monoms
+                     if sum(wj * e for wj, e in zip(w, m)) == d)
+
+    # 生成元: コンパクトなファセットの面と、座標方向の面
+    comp = [argmin(w) for w in normals]
+    coord = []
+    for j in range(n):
+        mn = min(m[j] for m in monoms)
+        coord.append(tuple(m for m in monoms if m[j] == mn))
+    gens_faces = comp + coord
+
+    # S が空でない = コンパクトな面。comp から始めて交わりで閉じる。
+    faces = list(dict.fromkeys(comp))
+    seen = set(faces)
+    frontier = list(faces)
+    while frontier:
+        nxt = []
+        for face in frontier:
+            fs = set(face)
+            for g in gens_faces:
+                inter = tuple(m for m in face if m in set(g))
+                if inter and inter != face and inter not in seen:
+                    seen.add(inter)
+                    faces.append(inter)
+                    nxt.append(inter)
+                    if len(faces) > max_faces:
+                        return None
+        frontier = nxt
     return faces
 
 
@@ -471,6 +633,43 @@ def newton_nondegenerate(f, gens, *, timeout_ms: int = 10000,
     return ("proved", None)
 
 
+def principal_face_compact(monoms, hplus, lam):
+    """Varchenko の公式が使える追加条件: 主面がコンパクトか。
+
+    非退化性だけでは足りない。ニュートン距離 t = 1/lambda に対し
+    p = t*(h+1) を Gamma_+ の境界上の点とすると、**p を含む最小の面
+    (主面) がコンパクトでないと公式は成り立たない**。
+
+    >>> f = -9*x0 - 38*x1^2*x2
+    f は原点で勾配が非零なので lambda = 1, m = 1 が真値。コンパクトな面は
+    辺 {(1,0,0), (0,2,1)} だけで、その上で grad != 0 なので「非退化」に
+    見え、LP は 3/2 を返す。しかし p = (2/3,2/3,2/3) は conv(台) の外で、
+    主面は x_2 方向に伸びる非コンパクトな面。公式は使えない。
+
+    コンパクトな面は conv(台) に含まれるので、判定は
+
+        p in conv(台)            (凸結合が存在するかの LP)
+
+    でよい。scipy が無ければ None (呼び出し側は 'unknown' に倒す)。
+    """
+    try:
+        from scipy.optimize import linprog
+    except Exception:
+        return None
+    if lam is None or lam is sp.oo or lam == 0:
+        return None
+    monoms = [tuple(m) for m in monoms]
+    n = len(monoms[0])
+    p = [float(sp.Rational(hj) / sp.nsimplify(lam)) for hj in hplus]
+    N = len(monoms)
+    A_eq = [[float(monoms[a][j]) for a in range(N)] for j in range(n)]
+    b_eq = list(p)
+    A_eq.append([1.0] * N)
+    b_eq.append(1.0)
+    res = linprog(c=[0.0] * N, A_eq=A_eq, b_eq=b_eq, bounds=[(0, None)] * N)
+    return bool(res.status == 0)
+
+
 def rlct_via_newton(f, gens, *, timeout_ms: int = 10000):
     """非退化なら Varchenko の定理で lambda を確定させる高速パス。
 
@@ -481,6 +680,12 @@ def rlct_via_newton(f, gens, *, timeout_ms: int = 10000):
     from resolve_singularity import newton_rlct
     st, face = newton_nondegenerate(f, gens, timeout_ms=timeout_ms)
     lam = newton_rlct(f, gens)
+    if st == "proved":
+        # 非退化だけでは足りない: 主面がコンパクトであることも要る
+        ok = principal_face_compact(sp.Poly(sp.expand(f), *gens).monoms(),
+                                    [1] * len(gens), lam)
+        if ok is not True:
+            st = "unknown"
     return (lam, st)
 
 
@@ -623,6 +828,68 @@ class Certificate:
         print(self.report())
 
 
+def _verify_product_leaf(ch, gens):
+    """積の分解で閉じた葉を独立に検証する。
+
+    解消側が記録した (lambda, m) を信用せず、
+      (1) f_rest が本当に変数について互いに素な因子に分かれるか
+      (2) 部分問題の値を計算し直し、min と位数の合流が一致するか
+    をここで確かめる。食い違えば 'refuted'。
+
+    Returns (status, witness)
+    """
+    from lemmas import product_split_value
+
+    lam_rec, m_rec, _why = ch.closed
+    try:
+        v = product_split_value(ch.k, ch.poly, ch.h, gens)
+    except Exception as e:                                # noqa: BLE001
+        return ("unknown", {"why": f"再計算できません: {str(e)[:50]}"})
+    if v is None:
+        return ("refuted", {"why": "互いに素な因子への分解を再現できません"})
+    lam, m = v
+    if sp.nsimplify(lam) != sp.nsimplify(lam_rec):
+        return ("refuted", {"why": f"再計算が一致しません ({lam} != {lam_rec})"})
+    if int(m) != int(m_rec):
+        return ("refuted", {"why": f"位数が一致しません ({m} != {m_rec})"})
+    return ("proved", None)
+
+
+def _verify_newton_leaf(ch, gens, *, timeout_ms: int = 10000):
+    """ニュートン高速パスで閉じた葉を独立に検証する。
+
+    解消側が記録した (lambda, m) を信用せず、
+      (1) 局所データ P = y^k * f_rest が実数体上ニュートン非退化であること
+      (2) LP による値が記録された lambda と一致すること
+      (3) 位数 m が一致すること
+    をここで計算し直す。どれかが食い違えば 'refuted' を返す
+    (帳簿のバグをそのまま proved にしないため)。
+
+    Returns (status, witness)
+    """
+    from resolve_singularity import newton_rlct
+
+    lam_rec, m_rec, _why = ch.closed
+    monoms = [tuple(ki + ei for ki, ei in zip(ch.k, m))
+              for m in ch.poly.monoms()]
+    P = sum(c * sp.prod([v ** e for v, e in zip(gens, mm)])
+            for c, mm in zip(ch.poly.coeffs(), monoms))
+    st, face = newton_nondegenerate(P, gens, timeout_ms=timeout_ms)
+    if st == "refuted":
+        return ("refuted", {"face": [tuple(a) for a in face] if face else None,
+                            "why": "ニュートン退化 (高速パスの適用が誤り)"})
+    if st != "proved":
+        return ("unknown", {"why": "非退化を判定できませんでした"})
+    lam = newton_rlct(P, gens, h=list(ch.h))
+    if sp.nsimplify(lam) != sp.nsimplify(lam_rec):
+        return ("refuted", {"why": f"LP の再計算が一致しません "
+                                   f"({lam} != {lam_rec})"})
+    m_new = newton_multiplicity(P, gens, h=list(ch.h))
+    if m_new is not None and int(m_new) != int(m_rec):
+        return ("refuted", {"why": f"位数が一致しません ({m_new} != {m_rec})"})
+    return ("proved", None)
+
+
 def certify(resolution, *, eps=sp.Integer(1), delta=sp.Rational(1, 100),
             timeout_ms: int = 10000, check_jacobian: bool = True,
             localize: bool = True) -> Certificate:
@@ -655,6 +922,8 @@ def certify(resolution, *, eps=sp.Integer(1), delta=sp.Rational(1, 100),
                 {v: sp.nsimplify(e - v) for v, e in st.subs})
 
     # --- 葉ごとの単元条件 --------------------------------------------
+    newton_leaves: List[str] = []
+    product_leaves: List[str] = []
     f_expr = sp.expand(resolution.f)
     for ch in resolution.charts:
         box = domains.get(ch.name)
@@ -688,9 +957,25 @@ def certify(resolution, *, eps=sp.Integer(1), delta=sp.Rational(1, 100),
         fib = [ch.phi[v] for v in gens] if localize else ()
         # この葉から中心を付け替えた点は、子の chart が担当するので除外する
         excl = recenter_pts.get(ch.name, [])
-        us, w = normal_crossing_on_box(ch.f_rest(), ch.k, ch.h, gens, box,
-                                       fiber=fib, exclusions=excl, delta=delta,
-                                       timeout_ms=timeout_ms)
+        closed = getattr(ch, "closed", None)
+        if closed is not None and closed[2] == "product":
+            # 積の分解で閉じた葉。分解が本当に変数について互いに素かと、
+            # 部分問題の値の合流を計算し直して検査する。
+            us, w = _verify_product_leaf(ch, gens)
+            if us == "proved":
+                product_leaves.append(ch.name)
+        elif closed is not None and closed[2] == "newton":
+            # ニュートン高速パスで閉じた葉。正規交差ではないので単元条件の
+            # 代わりに「局所データ y^k*f_rest が原点で実数体上ニュートン
+            # 非退化であること」を検証し、Varchenko の定理で値を認める。
+            # 再判定するのは、解消側のキャッシュや LP を信用しないため。
+            us, w = _verify_newton_leaf(ch, gens, timeout_ms=timeout_ms)
+            if us == "proved":
+                newton_leaves.append(ch.name)
+        else:
+            us, w = normal_crossing_on_box(ch.f_rest(), ch.k, ch.h, gens, box,
+                                           fiber=fib, exclusions=excl,
+                                           delta=delta, timeout_ms=timeout_ms)
         js, jw = "proved", None
         if check_jacobian:
             hmono = sp.prod([v ** e for v, e in zip(gens, ch.h)])
@@ -708,8 +993,11 @@ def certify(resolution, *, eps=sp.Integer(1), delta=sp.Rational(1, 100),
                 js, jw = nonzero_on_box(den, gens, box, fiber=fib,
                                         exclusions=excl, delta=delta,
                                         timeout_ms=timeout_ms)
-        leaves.append(LeafCertificate(ch.name, box, lam, m, us, js,
-                                      identity_ok=ident, witness=w or jw))
+        leaves.append(LeafCertificate(
+            ch.name, box, lam, m, us, js, identity_ok=ident, witness=w or jw,
+            note=("Newton 非退化 (Varchenko)" if ch.name in newton_leaves
+                  else ("互いに素な因子の積" if ch.name in product_leaves
+                        else ""))))
 
     # --- 被覆の状態 ---------------------------------------------------
     for name, ch in sorted(resolution.nodes.items()):
@@ -769,6 +1057,20 @@ def certify(resolution, *, eps=sp.Integer(1), delta=sp.Rational(1, 100),
     if resolution.n_pruned:
         reasons.append("枝刈りが行われています。証明モードでは prune=False "
                        "を使ってください (下界の仮定が入るため)。")
+    if product_leaves:
+        reasons.append(
+            f"{len(product_leaves)} 個の葉は正規交差まで解消せず、"
+            "変数の互いに素な因子への積分解 (積分が完全に分離する) から "
+            "lambda = min(部分問題) として閉じています。"
+            "部分問題はそれぞれ proved であることを確認済み。"
+        )
+    if newton_leaves:
+        reasons.append(
+            f"{len(newton_leaves)} 個の葉は正規交差まで解消せず、"
+            "ニュートン非退化 (実数体上、Z3 で充足不能を確認) から "
+            "Varchenko の定理で値を確定しています。"
+            "前提として Varchenko の公式を仮定 (Lean 未形式化)。"
+        )
 
     if bad:
         status = "refuted"
@@ -1025,20 +1327,39 @@ def rlct_certified(f, gens=None, *, timeout_ms: int = 20000,
         gens = sorted(sp.sympify(f).free_symbols, key=lambda s: s.name)
     gens = tuple(gens)
 
-    lam, st = rlct_via_newton(f, gens, timeout_ms=timeout_ms)
+    # 計時: 1 多項式ぶんの記録を開始する (入れ子なら外側が有効)。
+    # timing.last_record() で段階別の時間が取り出せる。
+    with _record("rlct_certified") as _rec:
+        _p = sp.Poly(sp.expand(f), *gens)
+        _add_meta(n_vars=len(gens), degree=int(_p.total_degree()),
+                  n_terms=len(_p.monoms()))
+        out = _rlct_certified_inner(f, gens, timeout_ms=timeout_ms,
+                                    max_depth=max_depth, verbose=verbose,
+                                    ideal=ideal, generators=generators, **kw)
+    return out
+
+
+def _rlct_certified_inner(f, gens, *, timeout_ms, max_depth, verbose,
+                          ideal, generators, **kw):
+    from resolve_singularity import resolve_singularities, ResolutionFailure
+
+    with _timed("newton"):
+        lam, st = rlct_via_newton(f, gens, timeout_ms=timeout_ms)
     if st == "proved":
         if verbose:
             print(f"  ニュートン非退化 -> lambda = {lam} (厳密)")
         return (lam, "proved", "newton")
 
+    gs = generators if generators is not None else _sum_of_squares(f, gens)
+
     # --- イデアルを運ぶ経路 (既定で有効) -----------------------------
     lam_ideal = None
     if ideal:
-        gs = generators if generators is not None else _sum_of_squares(f, gens)
         if gs:
             try:
                 from ideal_resolve import resolve_ideal
-                ri = resolve_ideal(gs, gens, max_depth=max_depth)
+                with _timed("ideal"):
+                    ri = resolve_ideal(gs, gens, max_depth=max_depth)
                 if ri.rlct is not sp.oo:
                     lam_ideal = ri.rlct
                     if verbose:
@@ -1046,14 +1367,50 @@ def rlct_certified(f, gens=None, *, timeout_ms: int = 20000,
             except Exception:
                 lam_ideal = None
 
+    # --- Aoyagi Lemma 1(1) の挟み込み --------------------------------
+    # 部分生成元の lambda は全体の lambda の厳密な下界、newton_rlct は
+    # 常に上界。一致すればブローアップなしで lambda が確定する。
+    # 一致しなくても、下界は分枝限定の早期終了に使える。
+    lb = None
+    if gs and len(gs) >= 2:
+        try:
+            from lemmas import squeeze_rlct
+            sq = squeeze_rlct(f, gens, gs)
+            if sq.status == "proved":
+                if verbose:
+                    print(f"  挟み込み {sq} -> lambda = {sq.rlct} (厳密)")
+                # 位数 m は挟み込みでは決まらないので返さない
+                return (sq.rlct, "proved", "squeeze(Aoyagi Lemma 1(1) + Newton LP)")
+            if sq.status != "inconsistent":
+                lb = sq.lo
+        except Exception:
+            lb = None
+
     try:
-        res = resolve_singularities(f, gens, prune=False, weighted=True,
-                                    max_depth=max_depth, **kw)
+        with _timed("resolve"):
+            res = resolve_singularities(f, gens, prune=False, weighted=True,
+                                        max_depth=max_depth,
+                                        lower_bound=lb, **kw)
     except ResolutionFailure as e:
+        # 解消が失敗したときだけ、挟み込みに大きな予算を与えて呼び直す
+        # (pay-when-needed: 易しいケースでは overhead をかけない)。
+        if gs and len(gs) >= 2:
+            try:
+                from lemmas import squeeze_rlct
+                sq2 = squeeze_rlct(f, gens, gs, max_subset=2, max_calls=24,
+                                   time_budget=8.0)
+                if sq2.status == "proved":
+                    return (sq2.rlct, "proved",
+                            "squeeze(Aoyagi Lemma 1(1) + Newton LP, 解消失敗後)")
+            except Exception:
+                pass
         if lam_ideal is not None:
             return (lam_ideal, "unknown", "ideal (多項式版は解消できず)")
         return (None, "unknown", f"解消できず ({e.reason})")
-    cert = certify(res, timeout_ms=timeout_ms)
+    _add_meta(n_charts=len(res.charts), n_blowups=res.n_blowups,
+              n_newton=res.n_newton)
+    with _timed("certify"):
+        cert = certify(res, timeout_ms=timeout_ms)
     lam_poly = res.rlct
 
     if lam_ideal is not None and lam_ideal < lam_poly:

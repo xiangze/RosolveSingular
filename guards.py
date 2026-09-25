@@ -57,16 +57,56 @@ def negative_tests() -> List[GuardResult]:
     out.append(GuardResult("nc: y+1 は proved", st3 == "proved",
                            f"status={st3}"))
 
-    # ニュートン非退化性: 退化している例で proved を返してはいけない
+    # ニュートン非退化性: 退化している例で proved を返してはいけない。
+    # (x+y^2)^2 + z^2 は「コンパクトなファセットだけ」を見ると非退化に
+    # 見えるが、辺 {(2,0,0),(1,2,0),(0,4,0)} もコンパクトな面で、そこでは
+    # (x+y^2)^2 の勾配がトーラス上 x = -y^2 で消える。真値は 1 なのに
+    # ファセットだけの判定では 5/4 を proved として返してしまった。
     for label, f, g in [("(x-y)^2", (x - y) ** 2, (x, y)),
                         ("(x^2-y^3)^2", (x**2 - y**3) ** 2, (x, y)),
+                        ("(x+y^2)^2+z^2", (x + y**2) ** 2 + z**2, (x, y, z)),
                         ("(xy-z^2)^2", (x * y - z**2) ** 2, (x, y, z))]:
         st4, _ = newton_nondegenerate(f, g, timeout_ms=8000)
         out.append(GuardResult(f"newton: {label} は非退化でない",
                                st4 != "proved", f"status={st4}"))
 
-    # 枝刈りを有効にしたら証明書は proved を返さない
-    res = resolve_singularities(x**2 + y**3, (x, y), prune=True)
+    # 主面がコンパクトでないと Varchenko の公式は使えない。
+    # f = -9*x0 - 38*x1^2*x2 は原点で勾配が非零なので lambda = 1 が真値だが、
+    # コンパクトな面の上では非退化で、LP は 3/2 を返す。主面は x2 方向に
+    # 伸びる非コンパクトな面なので、この経路で proved にしてはいけない。
+    from certify import (newton_faces, principal_face_compact,
+                         rlct_via_newton)
+    fsm = -9 * x + (-38) * y**2 * z
+    lam_n, st_n = rlct_via_newton(fsm, (x, y, z), timeout_ms=6000)
+    out.append(GuardResult(
+        "newton: 主面が非コンパクトなら proved にしない",
+        st_n != "proved", f"lambda={lam_n} status={st_n} (真値 1)"))
+    ok_pf = principal_face_compact(
+        sp.Poly(x**2 + y**2 + z**2, x, y, z).monoms(), [1, 1, 1],
+        sp.Rational(3, 2))
+    out.append(GuardResult("newton: x^2+y^2+z^2 の主面はコンパクト",
+                           ok_pf is True, f"{ok_pf}"))
+
+    # 台が薄い (変数が現れない / 単項式が少ない) ときも面を列挙できるか
+    fsp = 53 * x * z**3 + 61 * y**3 * z
+    fs2 = newton_faces(sp.Poly(fsp, x, y, z, sp.Symbol("w", real=True)).monoms())
+    out.append(GuardResult(
+        "newton: 台が薄くても面を列挙できる",
+        fs2 is not None and len(fs2) >= 1,
+        f"面 {len(fs2) if fs2 else 0} 個 (以前は 0 で unknown に落ちていた)"))
+
+    # 同じ例で、面の列挙が辺まで届いているか (ファセットだけなら 1 面)
+    fs = newton_faces(sp.Poly((x + y**2) ** 2 + z**2, x, y, z).monoms())
+    out.append(GuardResult(
+        "newton: コンパクトな面をファセット以外まで列挙する",
+        fs is not None and any(len(fa) == 3 and (1, 2, 0) in fa for fa in fs),
+        f"面 {len(fs) if fs else 0} 個"))
+
+    # 枝刈りを有効にしたら証明書は proved を返さない。
+    # ただし「実際に枝を刈ったとき」の話なので、1 枚で閉じてしまう
+    # ニュートン高速パスは切って、必ず探索が走る状態で試す。
+    res = resolve_singularities(x**2 + y**3, (x, y), prune=True,
+                                newton_fast=False)
     c = certify(res, timeout_ms=8000)
     out.append(GuardResult("prune=True では proved にしない",
                            c.status != "proved", f"status={c.status}"))
@@ -168,8 +208,10 @@ def independent_tests() -> List[GuardResult]:
 
     # chart を落とすと被覆の標本検証が gap を出す
     import copy
+    # ここはブローアップの被覆そのものを試す検査なので、chart を 1 枚で
+    # 閉じてしまうニュートン高速パスは切っておく。
     res = resolve_singularities(x**2 + y**2 + z**2, (x, y, z), prune=False,
-                                weighted=True)
+                                weighted=True, newton_fast=False)
     ok0 = covering_sample_check(res)
     out.append(GuardResult("被覆: 正しい chart 集合は consistent",
                            ok0["status"] == "consistent",
@@ -185,7 +227,7 @@ def independent_tests() -> List[GuardResult]:
 
 def aoyagi_lemma_tests() -> List[GuardResult]:
     """Aoyagi の補題 (真値を使わない関係式) が成り立つか。"""
-    from guards import (deepest_point_disagrees,
+    from aoyagi_lemmas import (deepest_point_disagrees,
                                ideal_invariance_disagrees,
                                monotonicity_disagrees, separation_disagrees)
     x, y, z = sp.symbols("x y z", real=True)
@@ -292,10 +334,182 @@ def known_issues() -> List[GuardResult]:
     return out
 
 
+def newton_fastpath_tests() -> List[GuardResult]:
+    """ニュートン高速パスは lambda と m を変えてはならない。
+
+    chart の局所データが非退化と分かった時点で Varchenko の定理で打ち切る
+    最適化 (resolve_singularities(newton_fast=True), 既定で有効) は、
+    真値を変えない「速くするだけ」の変更のはずである。on/off で値が食い違えば
+    実装のバグなので赤信号にする。
+    """
+    x, y, z, w = sp.symbols("x y z w", real=True)
+    cases = [
+        ("x^2+y^2", x**2 + y**2, (x, y)),
+        ("x^2+y^3", x**2 + y**3, (x, y)),
+        ("x^2*y^2", x**2 * y**2, (x, y)),
+        ("x^3+y^4+z^5", x**3 + y**4 + z**5, (x, y, z)),
+        ("(x-y)^2", (x - y) ** 2, (x, y)),
+        ("(xy+z^2)^2", (x * y + z**2) ** 2, (x, y, z)),
+        ("(x^2-y^3)^2", (x**2 - y**3) ** 2, (x, y)),
+        ("x^2+y^2+z^2+w^2", x**2 + y**2 + z**2 + w**2, (x, y, z, w)),
+        ("x^2*y+y^3", x**2 * y + y**3, (x, y)),
+        ("x^4+x^2*y^2+y^4", x**4 + x**2 * y**2 + y**4, (x, y)),
+    ]
+    out: List[GuardResult] = []
+    for label, f, g in cases:
+        vals = {}
+        for flag in (False, True):
+            try:
+                r = resolve_singularities(f, g, prune=False, weighted=True,
+                                          max_depth=20, newton_fast=flag)
+                vals[flag] = (r.rlct, r.multiplicity)
+            except Exception as e:                    # noqa: BLE001
+                vals[flag] = f"error:{type(e).__name__}"
+        out.append(GuardResult(
+            f"Newton 高速パス不変: {label}",
+            vals[False] == vals[True],
+            f"off={vals[False]} on={vals[True]}"))
+    return out
+
+
+def lemma_shortcut_tests() -> List[GuardResult]:
+    """Aoyagi の補題を使った短縮経路は lambda を変えてはならない。
+
+    (1) 積の分解 (product_split): 変数の互いに素な因子への分解。
+        k, h が何であっても積分が分離するので、on/off で (lambda, m) が
+        一致しなければ実装のバグ。
+    (2) 単調性による大域下界 (lower_bound): 部分生成元の lambda は全体の
+        lambda の厳密な下界なので、これを渡して早期終了させても lambda は
+        変わらない (m は下限になりうるので lambda だけを比べる)。
+    (3) 反例の確認: 和の分離を一般の chart で使うのは誤り。
+        x(x^2+y^2) = x^3+x*y^2 の lambda は 2/3 で、
+        lambda(x^3)+lambda(y^2) = 5/6 とは一致しない。
+    """
+    from lemmas import monotone_lower_bound, squeeze_rlct
+    from resolve_singularity import newton_rlct
+
+    x, y, z, w = sp.symbols("x y z w", real=True)
+    out: List[GuardResult] = []
+
+    # (1) 積の分解の on/off 一致
+    cases = [
+        ("(x^2+y^2)(z^2+w^3)", (x**2 + y**2) * (z**2 + w**3), (x, y, z, w)),
+        ("(x^2+y^3)(z^4)", (x**2 + y**3) * z**4, (x, y, z)),
+        ("x^2*y^2", x**2 * y**2, (x, y)),
+        ("(x-y)^2*(z^2+z^3)", (x - y)**2 * (z**2 + z**3), (x, y, z)),
+        ("(xy+z^2)^2", (x*y + z**2)**2, (x, y, z)),
+    ]
+    for label, f, g in cases:
+        vals = {}
+        for flag in (False, True):
+            try:
+                r = resolve_singularities(f, g, prune=False, weighted=True,
+                                          max_depth=20, product_split=flag)
+                vals[flag] = (r.rlct, r.multiplicity)
+            except Exception as e:                    # noqa: BLE001
+                vals[flag] = f"error:{type(e).__name__}"
+        out.append(GuardResult(f"積の分解が不変: {label}",
+                               vals[False] == vals[True],
+                               f"off={vals[False]} on={vals[True]}"))
+
+    # (2) 下界を渡しても lambda は変わらない
+    for label, G, g in [("<x^2, y^3>", [x**2, y**3], (x, y)),
+                        ("<xy, z^2>", [x*y, z**2], (x, y, z)),
+                        ("<x^2+y^2, z^2>", [x**2 + y**2, z**2], (x, y, z))]:
+        f = sp.expand(sum(t**2 for t in G))
+        lo, _wit, _n = monotone_lower_bound(G, g)
+        base = resolve_singularities(f, g, prune=False, weighted=True,
+                                     max_depth=20)
+        withlb = resolve_singularities(f, g, prune=False, weighted=True,
+                                       max_depth=20, lower_bound=lo)
+        out.append(GuardResult(f"大域下界で lambda 不変: {label}",
+                               base.rlct == withlb.rlct,
+                               f"lb={lo}, {base.rlct} vs {withlb.rlct}"))
+        # 下界は本当に下界か
+        out.append(GuardResult(f"下界 <= lambda: {label}",
+                               lo is None or lo <= base.rlct,
+                               f"{lo} <= {base.rlct}"))
+
+    # (3) 和の分離を一般の chart で使うのは誤り (反例が実際に反例であること)
+    f3 = sp.expand(x * (x**2 + y**2))
+    lam3 = newton_rlct(f3, (x, y))          # 非退化なので厳密
+    naive = sp.Rational(1, 3) + sp.Rational(1, 2)
+    out.append(GuardResult(
+        "和の分離の反例: x(x^2+y^2)",
+        lam3 == sp.Rational(2, 3) and lam3 != naive,
+        f"lambda={lam3}, 素朴な和={naive} (一致しないのが正しい)"))
+
+    # (4) 挟み込みが矛盾を出さない
+    for label, G, g in [("<x^2, y^3>", [x**2, y**3], (x, y)),
+                        ("<x*y, y*z, z*x>", [x*y, y*z, z*x], (x, y, z))]:
+        sq = squeeze_rlct(sp.expand(sum(t**2 for t in G)), g, G)
+        out.append(GuardResult(f"挟み込みが整合: {label}",
+                               sq.status != "inconsistent",
+                               str(sq)))
+    return out
+
+
+def regular_elimination_tests() -> List[GuardResult]:
+    """正則方向の消去 (nn_rlct._eliminate_regular) が lambda を変えないか。
+
+    消去は「g = A*v + B, A(0) != 0 なら v を消して lambda に 1/2 を足す」
+    という変形で、代入は擬剰余 (多項式) で行い、候補の順序も選ぶ。
+    どれも値を変えない最適化のはずなので、
+
+      (1) 消去を通した値 = もとの K = sum g_i^2 を直接解消した値
+      (2) 生成元の順序を入れ替えても同じ値
+
+    を確かめる。(1) は消去そのものの独立な検査、(2) は順序選択が
+    値に漏れていないかの検査になる。
+    """
+    from certify import rlct_certified
+    from nn_rlct import local_rlct_from_ideal
+
+    x, y, z, w = sp.symbols("x y z w", real=True)
+    cases = [
+        ("<x + y^2, z>", [x + y**2, z], (x, y, z)),
+        ("<x + y*z, y^2 - z^2>", [x + y*z, y**2 - z**2], (x, y, z)),
+        ("<x + y^2 + z^3, y*z>", [x + y**2 + z**3, y*z], (x, y, z)),
+        ("<x*y, z + x^2>", [x*y, z + x**2], (x, y, z)),
+        ("<w + x*y, x^2 + y^2>", [w + x*y, x**2 + y**2], (w, x, y)),
+        ("<x + y^2, x + z^2>", [x + y**2, x + z**2], (x, y, z)),
+    ]
+    out: List[GuardResult] = []
+    for label, G, g in cases:
+        K = sp.expand(sum(t**2 for t in G))
+        try:
+            lam_ref, st_ref, _ = rlct_certified(K, g, generators=G,
+                                                timeout_ms=5000, max_depth=14)
+        except Exception as e:                        # noqa: BLE001
+            lam_ref, st_ref = None, f"error:{type(e).__name__}"
+        try:
+            loc = local_rlct_from_ideal(G, list(g), max_depth=12)
+            lam_el = loc.rlct
+        except Exception as e:                        # noqa: BLE001
+            lam_el = f"error:{type(e).__name__}"
+        out.append(GuardResult(
+            f"正則消去 = 直接解消: {label}",
+            st_ref != "proved" or lam_el == lam_ref,
+            f"直接 {lam_ref} ({st_ref}) / 消去経由 {lam_el}"))
+
+        # 生成元の順序を逆にしても同じ値
+        try:
+            loc2 = local_rlct_from_ideal(list(reversed(G)), list(g),
+                                         max_depth=12)
+            lam_rev = loc2.rlct
+        except Exception as e:                        # noqa: BLE001
+            lam_rev = f"error:{type(e).__name__}"
+        out.append(GuardResult(f"正則消去が順序に依らない: {label}",
+                               lam_el == lam_rev,
+                               f"{lam_el} vs {lam_rev}"))
+    return out
+
+
 def run_all(verbose: bool = True):
     res = (negative_tests() + mutation_tests() + independent_tests()
            + aoyagi_lemma_tests() + vandermonde_truth_tests()
-           + coordinate_invariance_tests())
+           + coordinate_invariance_tests() + newton_fastpath_tests()
+           + lemma_shortcut_tests() + regular_elimination_tests())
     if verbose:
         for r in res:
             print("  " + str(r))

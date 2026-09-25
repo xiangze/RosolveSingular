@@ -26,6 +26,7 @@ import sympy as sp
 
 from certify import certify
 from families import family_rlct
+from timing import add_meta, last_record, record, timed
 from oracles import check_consistency, complexity_hints, cross_oracles
 from resolve_singularity import ResolutionFailure, resolve_singularities
 
@@ -59,35 +60,48 @@ def run_case(name, f, gens, family, *, max_depth=20, timeout_ms=8000,
                  "f": str(f)}
     t0 = time.time()
 
-    fam = family_rlct(f, gens)
-    if fam.status == "proved":
-        rec.update(status="proved", route=f"family:{fam.route}",
-                   rlct=str(fam.rlct), mult=fam.multiplicity)
-    else:
-        try:
-            res = resolve_singularities(f, gens, prune=False, weighted=True,
-                                        max_depth=max_depth)
-        except ResolutionFailure as e:
-            rec.update(status="unknown", route="resolve", rlct=None,
-                       resolve_fail=e.reason)
-            rec["time"] = round(time.time() - t0, 2)
-            rec["class"] = classify(rec)
-            return rec
-        except Exception as e:                       # noqa: BLE001
-            rec.update(status="unknown", route="resolve", rlct=None,
-                       resolve_fail="exception:" + str(e)[:60])
-            rec["time"] = round(time.time() - t0, 2)
-            rec["class"] = classify(rec)
-            return rec
-        cert = certify(res, timeout_ms=timeout_ms)
-        rec.update(status=cert.status, route="blowup+certify",
-                   rlct=str(res.rlct), mult=res.multiplicity,
-                   n_charts=len(res.charts))
-        rec["identity_bad"] = any(not lf.identity_ok for lf in cert.leaves)
-        rec["nc_refuted"] = any(lf.unit_status == "refuted"
-                                or lf.jac_status == "refuted"
-                                for lf in cert.leaves)
-        rec["covering_bad"] = any(c[1] != "proved" for c in cert.covering)
+    # 段階別の計時 (timing.py)。多項式のサイズ・次数と時間の関係を見るため。
+    with record(name, n_vars=rec["n_vars"], degree=rec["degree"],
+                n_terms=rec["n_terms"]):
+        with timed("family"):
+            fam = family_rlct(f, gens)
+        if fam.status == "proved":
+            rec.update(status="proved", route=f"family:{fam.route}",
+                       rlct=str(fam.rlct), mult=fam.multiplicity)
+        else:
+            try:
+                with timed("resolve"):
+                    res = resolve_singularities(f, gens, prune=False,
+                                                weighted=True,
+                                                max_depth=max_depth)
+            except ResolutionFailure as e:
+                rec.update(status="unknown", route="resolve", rlct=None,
+                           resolve_fail=e.reason)
+                rec["time"] = round(time.time() - t0, 2)
+                rec["timing"] = (last_record().as_dict()
+                                 if last_record() else None)
+                rec["class"] = classify(rec)
+                return rec
+            except Exception as e:                   # noqa: BLE001
+                rec.update(status="unknown", route="resolve", rlct=None,
+                           resolve_fail="exception:" + str(e)[:60])
+                rec["time"] = round(time.time() - t0, 2)
+                rec["class"] = classify(rec)
+                return rec
+            add_meta(n_charts=len(res.charts), n_blowups=res.n_blowups,
+                     n_newton=res.n_newton, n_newton_tests=res.n_newton_tests)
+            with timed("certify"):
+                cert = certify(res, timeout_ms=timeout_ms)
+            rec.update(status=cert.status, route="blowup+certify",
+                       rlct=str(res.rlct), mult=res.multiplicity,
+                       n_charts=len(res.charts),
+                       n_newton=res.n_newton)
+            rec["identity_bad"] = any(not lf.identity_ok for lf in cert.leaves)
+            rec["nc_refuted"] = any(lf.unit_status == "refuted"
+                                    or lf.jac_status == "refuted"
+                                    for lf in cert.leaves)
+            rec["covering_bad"] = any(c[1] != "proved" for c in cert.covering)
+    rec["timing"] = last_record().as_dict() if last_record() else None
 
     # 難しさの予測指標 (共変量)。判定には使わない。
     try:

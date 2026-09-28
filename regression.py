@@ -38,6 +38,21 @@ DEFAULT = ("guards", "structured", "nn")
 
 
 def _run_guards(verbose: bool) -> Dict:
+    # ガードは正しさの門なので、**必ずキャッシュ抜き**で走らせる。
+    # キャッシュを有効にしたまま回すと「自分が貯めた値で自分を検査する」
+    # ことになり、検査の意味が無くなる (cache_tests だけは自前で
+    # 一時キャッシュを作って使う)。
+    import rlct_cache as _rc
+    _saved = _rc.current()
+    _rc.disable()
+    try:
+        return _run_guards_inner(verbose)
+    finally:
+        if _saved is not None and _saved.path:
+            _rc.enable(_saved.path)
+
+
+def _run_guards_inner(verbose: bool) -> Dict:
     import guards
     t0 = time.time()
     res = guards.run_all(verbose=verbose)
@@ -132,10 +147,28 @@ def main() -> int:
     ap.add_argument("--max-depth", type=int, default=12)
     ap.add_argument("--timeout-ms", type=int, default=4000)
     ap.add_argument("--nn-timeout", type=int, default=30)
+    ap.add_argument("--cache", default="rlct_cache.json",
+                    help="解いた局所データの永続キャッシュ ('off' で無効)")
+    ap.add_argument("--rebuild-cache", action="store_true",
+                    help="キャッシュを 1 から作り直す")
+    ap.add_argument("--verify-cache", action="store_true",
+                    help="キャッシュの当たりを毎回計算し直して突き合わせる")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--out", default="")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
+
+    import rlct_cache
+    if str(args.cache).lower() in ("off", "none", ""):
+        rlct_cache.disable()
+        print("# キャッシュ: 無効")
+    else:
+        rlct_cache.enable(args.cache, rebuild=args.rebuild_cache,
+                          verify=args.verify_cache)
+        print(f"# キャッシュ: {rlct_cache.current()}")
+        print("#   (guards は必ずキャッシュ抜きで走ります。"
+              "多項式スイートを独立な検査として使いたいときは "
+              "--cache off か --verify-cache を付けてください)")
 
     suites = SUITES if args.all else tuple(
         s.strip() for s in args.suites.split(",") if s.strip())
@@ -165,12 +198,25 @@ def main() -> int:
             if r["inconsistent"]:
                 bad = True
                 print(f"  ** 独立な値と食い違い: {r['inconsistent']}")
+        # 段階別の実行時間 (多項式のサイズ・次数との関係)
+        if r.get("records"):
+            try:
+                from timing import timing_summary
+                print("  -- 実行時間 (秒) --")
+                print(timing_summary(r["records"], by=("n_vars",)))
+            except Exception as e:                    # noqa: BLE001
+                print(f"  (実行時間の集計に失敗: {e})")
         out.append(r)
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(out, fh, ensure_ascii=False, indent=1, default=str)
         print(f"\n-> {args.out}")
+
+    import rlct_cache as _rc2
+    if _rc2.current() is not None:
+        _rc2.save()
+        print(f"\n# {_rc2.current()}")
 
     print("\n===== 判定 =====")
     print("  NG (guards が赤、または独立な値との食い違いあり)" if bad

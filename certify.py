@@ -890,9 +890,58 @@ def _verify_newton_leaf(ch, gens, *, timeout_ms: int = 10000):
     return ("proved", None)
 
 
+def _verify_cache_leaf(ch, gens, *, trust: bool = True,
+                       timeout_ms: int = 10000):
+    """キャッシュで閉じた葉を検査する。
+
+    trust=True (既定): 安い健全性検査だけを行う。
+        エントリは (i) 証明された値しか入らず、(ii) コードの指紋が一致
+        するものしか読まないので、同じコードで計算し直せば同じ値になる。
+        すなわち「信用する」ことは「計算し直す」ことと同値である。
+        ただし **保存時のコードにバグがあれば同じバグを引き継ぐ** ので、
+        証明書の理由欄にその旨を残す。
+    trust=False: その局所データをキャッシュ抜きで解消し直して突き合わせる。
+        食い違えば refuted を返し、そのエントリは捨てるべき
+        (rlct_cache.invalidate) である。
+
+    Returns (status, witness)
+    """
+    lam_rec, m_rec, _why = ch.closed
+    from resolve_singularity import _lp_newton_value
+
+    monoms = [tuple(ki + ei for ki, ei in zip(ch.k, m))
+              for m in ch.poly.monoms()]
+    ub = _lp_newton_value(monoms, [hj + 1 for hj in ch.h], hot=True)
+    if ub != float("inf") and float(lam_rec) > ub * (1 + 1e-6) + 1e-9:
+        return ("refuted", {"why": f"上界を超えています ({lam_rec} > {ub})"})
+    if trust:
+        return ("proved", None)
+
+    # --- 計算し直して突き合わせる ---------------------------------
+    from resolve_singularity import (ResolutionFailure, resolve_singularities)
+    mono = sp.prod([v ** e for v, e in zip(gens, ch.k)])
+    sub = sp.expand(mono * ch.f_rest())
+    try:
+        res = resolve_singularities(sub, gens, prune=False, weighted=True,
+                                    h0=list(ch.h), max_depth=16,
+                                    use_cache=False)
+    except ResolutionFailure:
+        return ("unknown", {"why": "再計算できません (解消が失敗)"})
+    except Exception as e:                                # noqa: BLE001
+        return ("unknown", {"why": f"再計算できません ({str(e)[:40]})"})
+    c2 = certify(res, timeout_ms=timeout_ms, trust_cache=False)
+    if c2.status != "proved":
+        return ("unknown", {"why": f"再計算の証明書が {c2.status}"})
+    if sp.nsimplify(c2.rlct) != sp.nsimplify(lam_rec):
+        return ("refuted", {"why": f"再計算が一致しません "
+                                   f"({c2.rlct} != {lam_rec}) "
+                                   "-- rlct_cache.invalidate してください"})
+    return ("proved", None)
+
+
 def certify(resolution, *, eps=sp.Integer(1), delta=sp.Rational(1, 100),
             timeout_ms: int = 10000, check_jacobian: bool = True,
-            localize: bool = True) -> Certificate:
+            localize: bool = True, trust_cache: bool = True) -> Certificate:
     """解消の結果を検証し、三値の証明書を返す。
 
     eps      : 対象とする原点近傍 {|x_j| <= eps}
@@ -924,6 +973,7 @@ def certify(resolution, *, eps=sp.Integer(1), delta=sp.Rational(1, 100),
     # --- 葉ごとの単元条件 --------------------------------------------
     newton_leaves: List[str] = []
     product_leaves: List[str] = []
+    cache_leaves: List[str] = []
     f_expr = sp.expand(resolution.f)
     for ch in resolution.charts:
         box = domains.get(ch.name)
@@ -958,7 +1008,12 @@ def certify(resolution, *, eps=sp.Integer(1), delta=sp.Rational(1, 100),
         # この葉から中心を付け替えた点は、子の chart が担当するので除外する
         excl = recenter_pts.get(ch.name, [])
         closed = getattr(ch, "closed", None)
-        if closed is not None and closed[2] == "product":
+        if closed is not None and closed[2] == "cache":
+            us, w = _verify_cache_leaf(ch, gens, trust=trust_cache,
+                                       timeout_ms=timeout_ms)
+            if us == "proved":
+                cache_leaves.append(ch.name)
+        elif closed is not None and closed[2] == "product":
             # 積の分解で閉じた葉。分解が本当に変数について互いに素かと、
             # 部分問題の値の合流を計算し直して検査する。
             us, w = _verify_product_leaf(ch, gens)
@@ -997,7 +1052,8 @@ def certify(resolution, *, eps=sp.Integer(1), delta=sp.Rational(1, 100),
             ch.name, box, lam, m, us, js, identity_ok=ident, witness=w or jw,
             note=("Newton 非退化 (Varchenko)" if ch.name in newton_leaves
                   else ("互いに素な因子の積" if ch.name in product_leaves
-                        else ""))))
+                        else ("キャッシュ" if ch.name in cache_leaves
+                              else "")))))
 
     # --- 被覆の状態 ---------------------------------------------------
     for name, ch in sorted(resolution.nodes.items()):
@@ -1057,6 +1113,15 @@ def certify(resolution, *, eps=sp.Integer(1), delta=sp.Rational(1, 100),
     if resolution.n_pruned:
         reasons.append("枝刈りが行われています。証明モードでは prune=False "
                        "を使ってください (下界の仮定が入るため)。")
+    if cache_leaves:
+        reasons.append(
+            f"{len(cache_leaves)} 個の葉は過去に証明済みの値 (rlct_cache) を"
+            "再利用しています。コードの指紋が一致するエントリだけを読み、"
+            "当たりはニュートン LP の上界と突き合わせていますが、"
+            "**保存時のコードにバグがあればそれを引き継ぎます**。"
+            "厳密に確かめるなら certify(trust_cache=False) か "
+            "rlct_cache.disable() で計算し直してください。"
+        )
     if product_leaves:
         reasons.append(
             f"{len(product_leaves)} 個の葉は正規交差まで解消せず、"
@@ -1299,6 +1364,9 @@ def _sum_of_squares(f, gens):
     return None
 
 
+_LAST_CANDIDATES: List[tuple] = []
+
+
 def rlct_certified(f, gens=None, *, timeout_ms: int = 20000,
                    max_depth: int = 25, verbose: bool = False,
                    ideal: bool = True, generators=None, **kw):
@@ -1333,9 +1401,30 @@ def rlct_certified(f, gens=None, *, timeout_ms: int = 20000,
         _p = sp.Poly(sp.expand(f), *gens)
         _add_meta(n_vars=len(gens), degree=int(_p.total_degree()),
                   n_terms=len(_p.monoms()))
+        # キャッシュ: この計算で使ったエントリを depends_on に残すため、
+        # 開始時に記録をリセットする。
+        try:
+            import rlct_cache as _rc
+            _c = _rc.current()
+            if _c is not None:
+                _c.begin()
+        except Exception:
+            _rc, _c = None, None
         out = _rlct_certified_inner(f, gens, timeout_ms=timeout_ms,
                                     max_depth=max_depth, verbose=verbose,
                                     ideal=ideal, generators=generators, **kw)
+        # 証明できたものだけを保存する (unknown は決して入れない)
+        if _c is not None and out and out[1] == "proved" and out[0] is not None:
+            try:
+                _rc.put([0] * len(gens), [0] * len(gens), _p, gens,
+                        out[0], None, f"rlct_certified:{out[2]}")
+                # 部分木の値も入れる。これが本命で、別の問題の chart として
+                # 同じ局所データが現れたときに再利用される。
+                for kk, hh, pp, lam_s, m_s in _LAST_CANDIDATES:
+                    _rc.put(kk, hh, pp, gens, lam_s, m_s, "subtree")
+            except Exception:
+                pass
+        _LAST_CANDIDATES.clear()
     return out
 
 
@@ -1411,6 +1500,8 @@ def _rlct_certified_inner(f, gens, *, timeout_ms, max_depth, verbose,
               n_newton=res.n_newton)
     with _timed("certify"):
         cert = certify(res, timeout_ms=timeout_ms)
+    if cert.status == "proved":
+        _LAST_CANDIDATES.extend(getattr(res, "cache_candidates", []))
     lam_poly = res.rlct
 
     if lam_ideal is not None and lam_ideal < lam_poly:

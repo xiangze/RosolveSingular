@@ -493,6 +493,9 @@ class Resolution:
     n_newton: int = 0          # ニュートン高速パスで閉じた chart 数
     n_newton_tests: int = 0    # 非退化を試した chart 数
     n_product: int = 0         # 積の分解で閉じた chart 数
+    n_cache: int = 0           # キャッシュで閉じた chart 数
+    cache_candidates: List[tuple] = field(default_factory=list)
+    # (k, h, poly, lambda, m): 部分木の値。証明できたときだけ保存する。
     warnings: List[str] = field(default_factory=list)
     nodes: Dict[str, "Chart"] = field(default_factory=dict)
 
@@ -534,7 +537,8 @@ class Resolution:
             f"  枝刈り: {self.n_pruned},  LP 呼び出し: {self.n_lp}"
             + (f",  Newton 打ち切り: {self.n_newton}/{self.n_newton_tests}"
                if self.n_newton_tests else "")
-            + (f",  積の分解: {self.n_product}" if self.n_product else ""),
+            + (f",  積の分解: {self.n_product}" if self.n_product else "")
+            + (f",  キャッシュ: {self.n_cache}" if self.n_cache else ""),
             f"# RLCT lambda = {self.rlct}  (= {sp.nsimplify(self.rlct)}"
             + (f" ~ {float(self.rlct):.6f}" if self.rlct.is_Number and self.rlct.is_finite else "")
             + f"),  位数 m = {self.multiplicity}",
@@ -1083,6 +1087,7 @@ def resolve_singularities(
     newton_fast_max_vars: int = 24,
     product_split: bool = True,
     lower_bound=None,
+    use_cache: bool = True,
     verbose: bool = False,
 ) -> Resolution:
     """多項式 f の原点における特異点をブローアップの反復で解消する。
@@ -1152,6 +1157,13 @@ def resolve_singularities(
     newton_fast_max_terms, newton_fast_max_vars : int
         高速パスを試す上限 (これを超える chart では凸包・Z3 のコストが
         見合わないので判定しない)。
+    use_cache : bool
+        以前に解いた局所データ (k, h, f_rest) の値を rlct_cache から探し、
+        当たればその chart を閉じる (既定で有効)。正規化してあるので、
+        変数の入れ替え・定数倍・現れない変数の違いは吸収される。
+        誤った値の伝搬を防ぐため、当たりは毎回ニュートン LP の上界と
+        突き合わせ、コードの指紋が変わったエントリは読み込み時に捨てる。
+        rlct_cache.disable() か RLCT_CACHE=off で完全に切れる。
     product_split : bool
         chart の残差 f_rest が **変数の互いに素な因子**の積に分かれるとき、
         局所データ (y^k f_rest, y^h) の積分が完全に分離することを使って
@@ -1208,6 +1220,52 @@ def resolve_singularities(
     ub_cache: dict = {}
     nd_cache: dict = {}
     ps_cache: dict = {}
+    # --- 部分木の値の帳簿 (キャッシュに入れる候補を作る) ---------------
+    # 節点 X の局所データ (y^k f_rest, y^h) の原点での RLCT は、X を根と
+    # する部分木の chart の最小値に等しい。これを覚えておけば、別の問題で
+    # 同じ局所データが現れたときにそのまま使える。
+    # ただし (a) 枝刈りが入った部分木は最小値が下限にしかならない、
+    # (b) 中心の付け替えが入ると「原点での値」ではなく「箱全体の最小値」に
+    # なってしまうので、どちらかが起きた部分木は候補にしない。
+    _parent: Dict[str, Optional[str]] = {root.name: None}
+    _kids_left: Dict[str, int] = {}
+    _best: Dict[str, Optional[Tuple[sp.Rational, int]]] = {}
+    _clean: Dict[str, bool] = {}
+    _snap: Dict[str, Tuple[tuple, tuple, sp.Poly]] = {}
+    cache_candidates: List[tuple] = []
+
+    def _merge(cur, lam, m):
+        if lam is sp.oo or lam is None:
+            return cur
+        if cur is None or lam < cur[0]:
+            return (lam, m)
+        if lam == cur[0]:
+            # chart をまたぐ合流は **max**。zeta = sum_a zeta_a なので、
+            # 同じ lambda に同じ位数の極が複数あっても位数は足し算に
+            # ならない (互いに素な変数の積に分かれるときだけ足す)。
+            return (cur[0], max(cur[1], m))
+        return cur
+
+    def _finish(name, lam, m, cl):
+        """節点 name が値 (lam, m) で確定したことを親に伝播させる。"""
+        while True:
+            p = _parent.get(name)
+            if p is None:
+                return
+            _best[p] = _merge(_best.get(p), lam, m)
+            _clean[p] = _clean.get(p, True) and cl
+            _kids_left[p] = _kids_left.get(p, 1) - 1
+            if _kids_left[p] > 0:
+                return
+            v = _best.get(p)
+            if v is None:
+                return
+            if _clean.get(p, False) and p in _snap:
+                kk, hh, pp = _snap[p]
+                cache_candidates.append((list(kk), list(hh), pp, v[0], v[1]))
+            name, lam, m, cl = p, v[0], v[1], _clean.get(p, False)
+
+    n_cache = 0               # キャッシュで閉じた chart 数
     n_newton = 0              # ニュートン高速パスで閉じた chart 数
     n_newton_tests = 0
     n_product = 0             # 積の分解で閉じた chart 数
@@ -1287,6 +1345,7 @@ def resolve_singularities(
                     ch.note = (f"LB={lb} {'>' if cut else '>='} "
                                f"{bound if cut else achieved:.4g}")
                     ties_pruned = ties_pruned or tie
+                    _finish(ch.name, sp.oo, 0, False)
                     if verbose:
                         print(f"  [pruned]   {ch.name}: LB={lb} "
                               f"{'>' if cut else '>='} {bound if cut else achieved:.6f}")
@@ -1297,6 +1356,10 @@ def resolve_singularities(
             nc = _smooth_factor_change(ch, f"{ch.name}c")
             if nc is not None:
                 n_created += 1
+                _parent[nc.name] = ch.name
+                _kids_left[ch.name] = 1
+                _clean[ch.name] = True
+                _snap[ch.name] = (tuple(ch.k), tuple(ch.h), ch.poly)
                 stack.append(nc)
                 if verbose:
                     print(f"  [coordchg] {ch.name}: {nc.steps[-1].detail}")
@@ -1307,6 +1370,34 @@ def resolve_singularities(
         if recenter and n <= recenter_max_vars:
             for idx, pt in enumerate(_offorigin_centers(ch)):
                 recentered.append(_recenter(ch, pt, f"{ch.name}r{idx}"))
+
+        # ---- 2.4 キャッシュ ---------------------------------------
+        # 以前に (証明付きで) 解いた局所データと同じなら、その値で閉じる。
+        # 付け替え候補があるときは使わない (原点以外の寄与を取りこぼす)。
+        if not unit and use_cache and not recentered:
+            try:
+                import rlct_cache as _rc
+                hit = _rc.get(ch.k, ch.h, ch.poly, gens)
+            except Exception:
+                hit = None
+            if hit is not None:
+                lam_c, m_c = hit
+                ch.closed = (lam_c, m_c if m_c else 1, "cache")
+                ch.resolved = True
+                ch.status = "resolved(cache)"
+                ch.note = f"キャッシュ: lambda={lam_c}, m={m_c}"
+                ch.steps.append(
+                    Step("cache", f"既知の局所データ -> lambda = {lam_c}",
+                         ch.poly, tuple(ch.k), tuple(ch.h))
+                )
+                done.append(ch)
+                n_cache += 1
+                _finish(ch.name, lam_c, m_c or 1, True)
+                achieved = min(achieved, float(lam_c))
+                bound = min(bound, float(lam_c))
+                if verbose:
+                    print(f"  [cache]    {ch.name}: lambda={lam_c}, m={m_c}")
+                continue
 
         # ---- 2.5 ニュートン高速パス -------------------------------
         # f_rest が単元でなくても、局所データ y^k*f_rest が原点で
@@ -1335,6 +1426,7 @@ def resolve_singularities(
                 )
                 done.append(ch)
                 n_newton += 1
+                _finish(ch.name, lam_c, m_c, True)
                 achieved = min(achieved, float(lam_c))
                 bound = min(bound, float(lam_c))
                 if verbose:
@@ -1366,6 +1458,7 @@ def resolve_singularities(
                 )
                 done.append(ch)
                 n_product += 1
+                _finish(ch.name, lam_c, m_c, True)
                 achieved = min(achieved, float(lam_c))
                 bound = min(bound, float(lam_c))
                 if verbose:
@@ -1382,6 +1475,11 @@ def resolve_singularities(
                 achieved = min(achieved, float(lam_c))
                 bound = min(bound, float(lam_c))
             ch.status = "resolved+recenter"
+            _parent[f"{ch.name}#own"] = ch.name
+            _kids_left[ch.name] = len(recentered) + 1
+            _clean[ch.name] = False       # 付け替えは「原点での値」ではない
+            _snap[ch.name] = (tuple(ch.k), tuple(ch.h), ch.poly)
+            _finish(f"{ch.name}#own", lam_c, m_c, False)
             if verbose:
                 print(f"  [resolved] {ch.name}: lambda={lam_c}, m={m_c}"
                       f" (+ 付け替え {len(recentered)} 件)")
@@ -1394,6 +1492,7 @@ def resolve_singularities(
             if lam_c is not sp.oo:
                 achieved = min(achieved, float(lam_c))
                 bound = min(bound, float(lam_c))   # 到達値で incumbent を更新
+            _finish(ch.name, lam_c, m_c, True)
             if verbose:
                 print(f"  [resolved] {ch.name}: lambda={lam_c}, m={m_c}")
             continue
@@ -1424,8 +1523,13 @@ def resolve_singularities(
                                     lower=lb_now, nodes=dict(nodes))
 
         # 付け替え chart を積む
+        if recentered and ch.name not in _kids_left:
+            _kids_left[ch.name] = len(recentered)
+            _clean[ch.name] = False
+            _snap[ch.name] = (tuple(ch.k), tuple(ch.h), ch.poly)
         for rc in recentered:
             n_created += 1
+            _parent[rc.name] = ch.name
             ch.status = "recenter" if ch.status == "internal" else ch.status
             stack.append(rc)
         if unit:
@@ -1532,7 +1636,11 @@ def resolve_singularities(
             est = _subtree_lower_bound(new_k, new_h, 0, False)
             children.append((est if est is not sp.oo else sp.Integer(10) ** 9, child))
         # DFS スタックなので、有望なものが最後に push されるよう降順で積む
+        _kids_left[ch.name] = _kids_left.get(ch.name, 0) + len(children)
+        _clean.setdefault(ch.name, True)
+        _snap.setdefault(ch.name, (tuple(ch.k), tuple(ch.h), ch.poly))
         for _, child in sorted(children, key=lambda t: -t[0]):
+            _parent[child.name] = ch.name
             stack.append(child)
         ch.status = "blowup"
         n_blowups += 1
@@ -1563,6 +1671,18 @@ def resolve_singularities(
             " prune=False にしてください。",
             reason="prune-inconsistent", bound=(None if bound == float("inf") else bound),
             nodes=dict(nodes))
+
+    # 部分木の帳簿の自己検査: 根の部分木の値は集計した (lambda, m) に
+    # 一致しなければならない。ずれていたら帳簿のバグなので候補を全部捨てる。
+    _root_v = _best.get(root.name)
+    if cache_candidates:
+        if _kids_left.get(root.name, 0) != 0 or _root_v is None:
+            cache_candidates = []
+        elif (_root_v[0] != lam or _root_v[1] != mult):
+            warnings.append(
+                f"部分木の帳簿が集計と一致しません "
+                f"({_root_v} != ({lam}, {mult}))。キャッシュ候補を破棄しました。")
+            cache_candidates = []
 
     if lam is sp.oo:
         warnings.append("f は原点で消えていません (lambda = oo)。")
@@ -1595,6 +1715,8 @@ def resolve_singularities(
         n_newton=n_newton,
         n_newton_tests=n_newton_tests,
         n_product=n_product,
+        n_cache=n_cache,
+        cache_candidates=cache_candidates,
         warnings=warnings,
         nodes=nodes,
     )
@@ -1608,6 +1730,7 @@ _STATUS_STYLE = {
     "resolved+recenter": ("#d8f0d8", "解消済み + 付け替え"),
     "resolved(newton)": ("#cde8f7", "Newton 非退化で打ち切り"),
     "resolved(product)": ("#cdf7e8", "互いに素な因子の積に分解"),
+    "resolved(cache)": ("#f7f0cd", "キャッシュ"),
     "pruned":   ("#e6e6e6", "枝刈り"),
     "failed":   ("#f7cccc", "未解消"),
     "blowup":   ("#ffffff", "ブローアップ"),

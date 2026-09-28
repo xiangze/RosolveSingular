@@ -33,6 +33,9 @@ from resolve_singularity import ResolutionFailure, resolve_singularities
 import cases as cases_mod
 
 
+_VERIFY_CACHE = [False]          # --verify-cache のときだけ True
+
+
 def classify(rec: Dict) -> str:
     if rec.get("inconsistent"):
         return "inconsistent"
@@ -68,6 +71,11 @@ def run_case(name, f, gens, family, *, max_depth=20, timeout_ms=8000,
         if fam.status == "proved":
             rec.update(status="proved", route=f"family:{fam.route}",
                        rlct=str(fam.rlct), mult=fam.multiplicity)
+            import rlct_cache as _rc
+            if _rc.current() is not None and fam.rlct is not sp.oo:
+                _rc.put([0] * len(gens), [0] * len(gens),
+                        sp.Poly(sp.expand(f), *gens), gens,
+                        fam.rlct, fam.multiplicity, f"family:{fam.route}")
         else:
             try:
                 with timed("resolve"):
@@ -89,18 +97,26 @@ def run_case(name, f, gens, family, *, max_depth=20, timeout_ms=8000,
                 rec["class"] = classify(rec)
                 return rec
             add_meta(n_charts=len(res.charts), n_blowups=res.n_blowups,
-                     n_newton=res.n_newton, n_newton_tests=res.n_newton_tests)
+                     n_newton=res.n_newton, n_newton_tests=res.n_newton_tests,
+                     n_product=res.n_product)
             with timed("certify"):
-                cert = certify(res, timeout_ms=timeout_ms)
+                cert = certify(res, timeout_ms=timeout_ms,
+                               trust_cache=not _VERIFY_CACHE[0])
             rec.update(status=cert.status, route="blowup+certify",
                        rlct=str(res.rlct), mult=res.multiplicity,
                        n_charts=len(res.charts),
-                       n_newton=res.n_newton)
+                       n_newton=res.n_newton, n_product=res.n_product)
             rec["identity_bad"] = any(not lf.identity_ok for lf in cert.leaves)
             rec["nc_refuted"] = any(lf.unit_status == "refuted"
                                     or lf.jac_status == "refuted"
                                     for lf in cert.leaves)
             rec["covering_bad"] = any(c[1] != "proved" for c in cert.covering)
+            rec["n_cache_hit"] = res.n_cache
+            # 証明できたときだけ、根と部分木の値をキャッシュに登録する
+            if cert.status == "proved":
+                import rlct_cache as _rc
+                rec["n_cache_put"] = _rc.record_resolution(
+                    res, gens, proved=True, f=f)
     rec["timing"] = last_record().as_dict() if last_record() else None
 
     # 難しさの予測指標 (共変量)。判定には使わない。
@@ -158,7 +174,23 @@ def main():
                     help="体積の漸近による独立な数値推定と突き合わせる (遅い)")
     ap.add_argument("--covering", action="store_true",
                     help="被覆の前向き標本検証を行う (n <= 4)")
+    ap.add_argument("--cache", default="rlct_cache.json",
+                    help="解いた局所データの永続キャッシュ ('off' で無効)")
+    ap.add_argument("--rebuild-cache", action="store_true",
+                    help="キャッシュを 1 から作り直す")
+    ap.add_argument("--verify-cache", action="store_true",
+                    help="キャッシュの当たりを毎回計算し直して突き合わせる "
+                         "(遅いが、古い誤りが伝搬していないかを確かめられる)")
     args = ap.parse_args()
+
+    import rlct_cache
+    if str(args.cache).lower() in ("off", "none", ""):
+        rlct_cache.disable()
+    else:
+        rlct_cache.enable(args.cache, rebuild=args.rebuild_cache,
+                          verify=args.verify_cache)
+        _VERIFY_CACHE[0] = args.verify_cache
+        print(f"# キャッシュ: {rlct_cache.current()}")
 
     cs = cases_mod.structured_cases(args.max_vars)
     if args.random:
@@ -182,6 +214,10 @@ def main():
               f"lambda={rec.get('rlct')} ({rec['time']}s)"
               + ("  !! " + "; ".join(rec["inconsistent"])
                  if rec.get("inconsistent") else ""), flush=True)
+    import rlct_cache as _rc
+    if _rc.current() is not None:
+        _rc.save()
+        print(f"# {_rc.current()}")
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(recs, fh, ensure_ascii=False, indent=1)
     print(f"-> {args.out} に {len(recs)} 件")

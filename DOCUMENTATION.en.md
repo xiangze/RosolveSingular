@@ -211,6 +211,32 @@ Measured on 54 random polynomials (n = 2..4, d = 3..5):
 | `newton_fast=False` | 14.7s | 0.062s | 302 | 46/54 |
 | `newton_fast=True` | 6.0s | 0.019s | 146 | 49/54 |
 
+#### Product split (`product_split=True`, default)
+
+When a chart's residual `f_rest` factors into **variable-disjoint factors**
+`A(u)·B(v)`, the local integral separates completely:
+
+    ζ(z) = ∫|u^{k_u}A|^z u^{h_u} du · ∫|v^{k_v}B|^z v^{h_v} dv
+
+so `λ = min(λ_A, λ_B)` and the multiplicity is the sum over the factors
+attaining the minimum. This holds **for any `k, h`**, so it applies at every
+node of the tree. A variable `y_j` appearing in no factor carries only the
+monomial `y_j^{k_j}`, and joins the same rule as a one-variable subproblem with
+value `(h_j+1)/k_j`.
+
+Each subproblem must come back `proved` before the value is adopted, and
+`certify()` recomputes the split and the join to check it (mismatch ⇒
+`refuted`).
+
+`(x²+y²)(z²+w³)`: 6 charts / 0.22s → **1 chart / 0.07s** (λ = 5/6, m = 1, same).
+
+#### Early termination from a global lower bound (`lower_bound=`)
+
+Given a **certified lower bound** on λ, the search stops as soon as the
+incumbent reaches it. The bound comes from Aoyagi's Lemma 1(1) (`lemmas.py`).
+λ stays exact, but the multiplicity `m` becomes a lower bound once the search
+is cut short, and a warning records that.
+
 #### Branch and bound (`prune=True` / `'ties'`)
 
 λ is a minimum over charts, so pruning is legitimate.
@@ -265,6 +291,36 @@ Two localizations are essential:
   holding on a neighbourhood
 - **Territory of recentred charts**: a recentred chart owns only the δ-ball
   around its point; the parent owns the box minus that ball
+
+
+#### Enumerating the compact faces (facets alone are not enough)
+
+Varchenko's nondegeneracy condition is a condition on **every compact face** of
+Γ₊(f); checking only the facets is unsound.
+
+> `f = (x + y²)² + z² = x² + 2xy² + y⁴ + z²` has exactly one compact facet
+> (normal (2,1,2)), and on it `∇f_σ = 0` is incompatible with `z ≠ 0`, so it
+> *looks* nondegenerate. But the edge `{(2,0,0), (1,2,0), (0,4,0)}` is also a
+> compact face, and its face polynomial `(x+y²)²` has a torus critical point at
+> `x = -y²`. The true λ is 1; facet-only checking **returned 5/4 as proved**.
+
+The correct enumeration uses `face(w₁ + w₂) = face(w₁) ∩ face(w₂)` (when the
+intersection is non-empty): every face of Γ₊ is
+
+    face(w) = ∩_{i∈S} face(n_i) ∩ ∩_{j∈T} face(e_j)
+
+with `n_i` the compact facet normals and `face(e_j) = {m : m_j minimal}`, and
+`w > 0` exactly when **S is non-empty** — i.e. the compact faces. So starting
+from the compact facets' faces and closing under intersection with the other
+facet faces and the coordinate faces produces all of them. Past a cap on the
+number of faces the function returns `None` and the check falls back to
+`unknown`.
+
+The bug surfaced through `bench/guards.py::regular_elimination_tests()`, which
+cross-checks the regular-direction elimination against a direct resolution of
+`K = Σg_i²`: `<x + y², z>` gave 5/4 (proved) directly and 1 through the
+elimination. After the fix, the 158-case benchmark is **unchanged** (149/158
+proved, same values) — only correctness was being lost, not capability.
 
 #### Domain tracking
 
@@ -433,6 +489,26 @@ Observation: with θ\* in a cell interior the core is usually empty, i.e. the
 point is regular. **The essential singularities of ReLU networks concentrate on
 cell boundaries.**
 
+#### Eliminating regular directions by pseudo-division
+
+For `g = A·v + B` with `A(0) ≠ 0`, the variable `v` is eliminated. This used to
+substitute `h.subs(v, -B/A)` and clean up with `sp.cancel(sp.together(...))`;
+when `A` is a polynomial, `-B/A` is a rational function, coefficients grew to 28
+digits and `cancel` dominated (10.7s of 19.7s on the tanh 1-2-1 core).
+
+It now uses the **pseudo-remainder**. For `h = Σ_e c_e(others)·v^e`,
+
+    A^d · h(-B/A) = Σ_e c_e (-B)^e A^{d-e}      (d = deg_v h)
+
+is built by Horner's rule entirely within the polynomial ring. `A` is a unit at
+the origin, so multiplying by `A^d` changes neither the local ideal nor the
+RLCT; the integer content is divided out afterwards (a non-zero rational
+multiple). Candidates are ordered by "`A` constant" then "`A`, `B` small".
+
+Measured (tanh 1-2-1, 7 variables, 6 generators): **19.7s → 1.50s (13×)**, and
+the core generators shrink from 139/137/136 terms of degree 10 to 49/47/46 of
+degree 7, which speeds up the resolution that follows (6.8s → 2.9s end to end).
+
 ### 4.7 `torch_rlct.py` — importing PyTorch models
 
 ```python
@@ -450,6 +526,157 @@ rep.print_report()
   always regular
 - `targets` is only used to verify θ\* is realizable; the fibre ideal is always
   built treating the model at θ\* as the truth
+
+### 4.7.4 `lemmas.py` — Aoyagi's lemmas used to *shorten* the computation
+
+Where `bench/aoyagi_lemmas.py` uses the same lemmas as *checks*, this module
+uses them as *computation*. **Telling apart what can and cannot be used is the
+whole point**, so the reasoning and the counterexamples live in the module
+docstring.
+
+**Usable (1): Lemma 1(1) monotonicity, as a squeeze.**
+Since `Σ_{i∈S} g_i² ≤ Σ_i g_i²` pointwise, `λ(subset) ≤ λ(full)` — a subset of
+the generators gives an **exact lower bound**. `newton_rlct` is always an upper
+bound, nondegenerate or not, so
+
+    λ(subset) ≤ λ ≤ newton_rlct(f)
+
+and if the two ends meet, **λ is determined with no blow-up at all**.
+
+```python
+from lemmas import squeeze_rlct, monotone_lower_bound
+sq = squeeze_rlct(f, gens, generators)
+sq.status   # 'proved' ⇒ sq.rlct is exact
+```
+
+Subsets have fewer variables and lower degree, so the closed-form routes in
+`families.py` usually settle them. **The squeeze does not determine `m`**, so
+the multiplicity is returned as a lower bound on that route. Even when the ends
+do not meet, `sq.lo` feeds `resolve_singularities(lower_bound=...)`.
+`certify.rlct_certified` and `nn_rlct.local_rlct_from_ideal` use it
+automatically (route `squeeze`, `LocalRLCT.core_route == 'squeeze'`).
+
+**Cost caps are essential.** The closed-form routes call Newton nondegeneracy
+(hull + z3) internally, so on large generators they cost more than the search
+itself. Measured on the tanh 1-2-1 core (7 variables, 6 generators):
+
+| | squeeze | product split |
+|---|---|---|
+| uncapped | 7s → **146s** | 7s → **52s** |
+| capped | 7s → 6.8s (0.06s) | 7s → 6.7s (0.003s) |
+
+Two caps did the work:
+
+1. **Estimate the size before expanding.** Expanding `Σ_{i∈S} g_i²` just to
+   measure it is itself the dominant cost (in the tanh core a 20-term generator
+   squares to 235 terms). The bound `Σ n_i(n_i+1)/2` from the generators' own
+   term counts rejects a subset without expanding it. Call count and a
+   wall-clock budget cut the rest.
+2. **Pay when needed.** The first pass is cheap (0.5s, single generators only);
+   the budget is raised (8s, pairs) **only after the resolution fails**.
+
+The product split guards `factor_list` with a **sound O(1) sieve**: monomial
+content is already stripped, so a split `f_rest = A(u)·B(v)` forces both A and
+B to have ≥ 2 terms and the exponent support to be a direct product
+`S = S_u × S_v`. Hence
+
+> the number of monomials must be a composite number ≥ 4
+
+is necessary — a prime count (or ≤ 3) skips `factor_list` entirely.
+
+**Usable (2): the product split** — see 4.1. `product_split_value()`.
+
+**Not usable (3): Lemma 2 (sum separation) at a general chart.**
+Even when `f_rest = A(u) + B(v)` separates, the local data is
+`P = y^k(A+B) = u^{k_u}v^{k_v}A + u^{k_u}v^{k_v}B` — the monomial factor
+multiplies **both** terms, so `P` itself does not separate.
+
+> Counterexample: `x(x²+y²) = x³ + xy²` has λ = 2/3 (nondegenerate), while
+> `λ(x³) + λ(y²) = 1/3 + 1/2 = 5/6`.
+
+It is valid only at nodes with `k = 0` (measured: 3.8% of chart nodes, against
+29.3% that separate structurally), which `families.py` already covers.
+
+**Not usable (4): Theorem 2 as a licence to skip recentring.**
+"Homogeneous ⇒ the origin is deepest ⇒ no recentring needed" is **false**.
+
+> Counterexample: `x² + y² − z²` is homogeneous, but λ at the origin is 1 while
+> the smooth points of the cone give λ = 1/2 — the origin is not deepest.
+
+Theorem 2 compares **separate groups of variables** (sending a group in which
+`f` is homogeneous to zero does not increase λ); it says nothing about the
+origin versus other points of one chart.
+
+`bench/guards.py::lemma_shortcut_tests()` watches all of this on every run
+(5 on/off agreements, 6 soundness checks on the bound, 1 counterexample,
+2 consistency checks on the squeeze).
+
+### 4.7.6 `rlct_cache.py` — a persistent cache of solved local data
+
+Values solved during a regression run are stored and reused when **the same
+local datum turns up inside the resolution of a different, larger polynomial**.
+
+#### The key
+
+A chart's value is not determined by `f_rest` alone — the local zeta function is
+
+    Z(z) = ∫ |y^k · f_rest(y)|^z · |y^h| dy
+
+so the key is the whole local datum `(k, h, f_rest)`, normalised to a
+representative of its equivalence class: variables may be permuted (together
+with `k`, `h` and the exponents), `f` may be scaled by a non-zero constant, and
+variables occurring in neither `f` nor `k` are dropped (they only contribute a
+volume factor). Normalisation only raises the hit rate; correctness of a hit
+comes from putting the full normalised data into the key, so a weak
+normalisation causes misses, never false hits.
+
+#### What is stored — subtree values
+
+Storing only root results would hit only when `k = h = 0`. The useful entries
+are **subtree values**: the RLCT at the origin of a node's local datum equals
+the minimum over the charts of the subtree rooted there. Subtrees that contain
+pruning (the minimum is only a lower bound) or recentring (the value becomes
+the minimum over the whole box, not at the origin) are not offered. As a
+self-check, if the root's subtree value disagrees with the aggregated
+`(λ, m)`, every candidate is discarded. Multiplicities combine with `max`
+across charts (`ζ = Σ ζ_a`, so orders do not add), and with `+` only across
+variable-disjoint factors.
+
+#### Keeping bugs from propagating
+
+A wrong value for a simple polynomial would otherwise contaminate every later
+computation that uses it. Four defences:
+
+1. **Only proved values are stored** — certified by `certify`, or fixed by a
+   closed-form family route. `unknown` never enters.
+2. **A code fingerprint** (sha256 over `resolve_singularity.py`, `certify.py`,
+   `families.py`, `lemmas.py`, `ideal_resolve.py`, `rlct_cache.py`) is stored
+   with each entry. **Fixing a bug changes the fingerprint, so old entries are
+   dropped at load time automatically.**
+3. **Dependencies are recorded** (`depends_on`), so `invalidate(key)` removes
+   transitively everything that used a value later found wrong.
+4. **Every hit is bounds-checked**: the Newton LP is always an upper bound, so
+   `λ ≤ newton_rlct(local datum)` must hold. A violation drops the entry,
+   counts as `poisoned`, and the value is recomputed.
+
+A wrong value *inside* the bound survives (4); the route for that is
+**`certify(trust_cache=False)`**, which re-resolves the cached local datum
+without the cache and returns `refuted` on a mismatch.
+
+```sh
+python run.py --random --rebuild-cache   # rebuild from scratch
+python run.py --random --cache off       # do not use it at all
+python run.py --random --verify-cache    # recompute every hit and compare
+python regression.py --all --rebuild-cache
+```
+
+The library default is **off** (`rlct_cache.enable(path)`, or the `RLCT_CACHE`
+environment variable); only the bench runners turn it on. `regression.py`
+always runs the **guards suite with the cache disabled**, so the correctness
+gate never validates itself from its own store.
+
+`bench/guards.py::cache_tests()` runs 12 checks on every invocation, including
+that a wrong-but-plausible entry is caught by `trust_cache=False`.
 
 ### 4.7.5 `timing.py` — phase-level timing
 
@@ -566,6 +793,9 @@ added.
 
 | Bug | Symptom | Fix |
 |---|---|---|
+| **The compactness of the principal face was not checked** | `−9x₀−38x₁²x₂` returned λ = 3/2 as **proved** (true value 1 — f is smooth at the origin) | require `p ∈ conv(supp)` (an LP) before claiming proved |
+| Faces could not be enumerated on thin supports | `53x₀x₂³+61x₁³x₂` in 4 variables gave no normals, so the resolution looped forever | drop unused variables, fall back to subset enumeration by LP |
+| **Only facets were checked, not all compact faces** | `(x+y²)²+z²` returned λ = 5/4 as **proved** (true value 1) | close the faces under intersection to enumerate every compact face |
 | missed non-normal-crossing points on the exceptional divisor | `(x−y)²` gave λ=1 (true 1/2) | added recentring |
 | recentring too aggressive | considered points not mapping to the origin | added the `φ(p)=0` test |
 | dropped units were not recorded | identity failed | track `Chart.unit` |

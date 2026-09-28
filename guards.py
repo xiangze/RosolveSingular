@@ -505,11 +505,142 @@ def regular_elimination_tests() -> List[GuardResult]:
     return out
 
 
+def cache_tests() -> List[GuardResult]:
+    """永続キャッシュ (rlct_cache) が誤りを運ばないか。
+
+    キャッシュ固有の危険は「簡単な多項式の誤った値が、それを部分問題に
+    もつ複雑な計算に伝搬する」こと。防御が実際に働くかをここで確かめる。
+
+      (1) 当たり/外れで lambda が変わらない (A/B)
+      (2) 上界を超える値は当たりの時点で捨てられる
+      (3) 上界内だが誤った値は certify(trust_cache=False) が refuted にする
+      (4) コードの指紋が違うエントリは読み込まれない
+      (5) 依存関係をたどって推移的に無効化できる
+      (6) clear() で 1 から作り直せる
+      (7) 変数の入れ替え・定数倍は同じキー、別の問題は別のキー
+    """
+    import json
+    import os
+    import tempfile
+
+    import rlct_cache as RC
+    from certify import certify, rlct_certified
+
+    x, y, z = sp.symbols("x y z", real=True)
+    out: List[GuardResult] = []
+    tmpdir = tempfile.mkdtemp(prefix="rlctcache")
+    path = os.path.join(tmpdir, "c.json")
+    saved = RC.current()
+
+    try:
+        # (7) キーの同値性
+        k1 = RC.canonical_key([0, 0], [0, 0], sp.Poly(x**2 + y**3, x, y), (x, y))
+        k2 = RC.canonical_key([0, 0], [0, 0], sp.Poly(3 * (y**3 + x**2), y, x),
+                              (y, x))
+        k3 = RC.canonical_key([0, 0], [0, 0], sp.Poly(x**2 + y**4, x, y), (x, y))
+        out.append(GuardResult("cache: 入れ替え・定数倍は同じキー",
+                               k1 == k2 and k1 is not None, f"{k1} / {k2}"))
+        out.append(GuardResult("cache: 別の問題は別のキー", k1 != k3,
+                               f"{k1} / {k3}"))
+        k4 = RC.canonical_key([1, 0], [0, 0], sp.Poly(x**2 + y**3, x, y), (x, y))
+        out.append(GuardResult("cache: k が違えば別のキー", k1 != k4,
+                               f"{k1} / {k4}"))
+
+        # (1) A/B: キャッシュの有無で lambda が変わらない
+        cases = [("(xy+z^2)^2", (x * y + z**2) ** 2, (x, y, z)),
+                 ("x^2+y^2+z^2", x**2 + y**2 + z**2, (x, y, z)),
+                 ("x^2*y^2", x**2 * y**2, (x, y))]
+        RC.disable()
+        base = {nm: rlct_certified(f, g, timeout_ms=5000, max_depth=14)[0]
+                for nm, f, g in cases}
+        RC.enable(path, rebuild=True)
+        for nm, f, g in cases:                 # 1 周目: 作る
+            rlct_certified(f, g, timeout_ms=5000, max_depth=14)
+        after = {nm: rlct_certified(f, g, timeout_ms=5000, max_depth=14)[0]
+                 for nm, f, g in cases}        # 2 周目: 使う
+        for nm, _f, _g in cases:
+            out.append(GuardResult(f"cache: A/B で lambda 不変 {nm}",
+                                   base[nm] == after[nm],
+                                   f"off={base[nm]} on={after[nm]}"))
+        n_entries = len(RC.current().entries)
+        out.append(GuardResult("cache: エントリが貯まる", n_entries > 0,
+                               f"{n_entries} 件"))
+
+        # (2) 上界を超える値は捨てられる
+        c = RC.current()
+        poly = sp.Poly((x * y + z**2) ** 2, x, y, z)
+        key = RC.canonical_key([0, 0, 0], [0, 0, 0], poly, (x, y, z))
+        c.put(key, sp.Integer(99), 1, "でっちあげ")
+        got = c.get(key, k=[0, 0, 0], h=[0, 0, 0], poly=poly, gens=(x, y, z))
+        out.append(GuardResult("cache: 上界を超える値は当たりで捨てる",
+                               got is None and c.n_poisoned >= 1,
+                               f"got={got}, poisoned={c.n_poisoned}"))
+
+        # (3) 上界内だが誤った値 -> trust_cache=False で refuted
+        from resolve_singularity import resolve_singularities
+        c.put(key, sp.Rational(1, 3), 1, "でっちあげ(上界内)")
+        res = resolve_singularities((x * y + z**2) ** 2, (x, y, z),
+                                    prune=False, weighted=True)
+        used = any(getattr(ch, "closed", None) and ch.closed[2] == "cache"
+                   for ch in res.charts)
+        if used:
+            cert = certify(res, timeout_ms=5000, trust_cache=False)
+            ok = cert.status != "proved"
+        else:
+            ok, cert = True, None
+        out.append(GuardResult(
+            "cache: 誤った値は trust_cache=False で proved にしない",
+            ok, f"使われた={used}" + (f", status={cert.status}" if cert else "")))
+        c.entries.pop(key, None)
+
+        # (4) 指紋が違えば読み込まない
+        c.put(RC.canonical_key([0, 0], [0, 0], sp.Poly(x**2 + y**3, x, y),
+                               (x, y)), sp.Rational(5, 6), 1, "test")
+        c.save()
+        raw = json.load(open(path, encoding="utf-8"))
+        for e in raw["entries"].values():
+            e["fingerprint"] = "0" * 16
+        json.dump(raw, open(path, "w", encoding="utf-8"))
+        c2 = RC.Cache(path)
+        out.append(GuardResult("cache: 指紋が違うエントリは読まない",
+                               len(c2.entries) == 0 and c2.n_stale > 0,
+                               f"{len(c2.entries)} 件, stale={c2.n_stale}"))
+
+        # (5) 推移的な無効化
+        c3 = RC.Cache(None)
+        c3.put("A", sp.Rational(1, 2), 1, "t", depends_on=[])
+        c3.put("B", sp.Rational(1, 3), 1, "t", depends_on=["A"])
+        c3.put("C", sp.Rational(1, 4), 1, "t", depends_on=["B"])
+        c3.put("D", sp.Rational(1, 5), 1, "t", depends_on=[])
+        removed = set(c3.invalidate("A"))
+        out.append(GuardResult("cache: 依存を推移的に無効化できる",
+                               removed == {"A", "B", "C"}
+                               and set(c3.entries) == {"D"},
+                               f"消した {sorted(removed)}"))
+
+        # (6) 作り直し
+        RC.enable(path)
+        RC.current().put("Z", sp.Integer(1), 1, "t")
+        RC.current().save()
+        exists_before = os.path.exists(path)
+        RC.clear()
+        out.append(GuardResult("cache: clear() で 1 から作り直せる",
+                               exists_before and not os.path.exists(path)
+                               and len(RC.current().entries) == 0,
+                               f"ファイル {os.path.exists(path)}"))
+    finally:
+        RC.disable()
+        if saved is not None and saved.path:
+            RC.enable(saved.path)
+    return out
+
+
 def run_all(verbose: bool = True):
     res = (negative_tests() + mutation_tests() + independent_tests()
            + aoyagi_lemma_tests() + vandermonde_truth_tests()
            + coordinate_invariance_tests() + newton_fastpath_tests()
-           + lemma_shortcut_tests() + regular_elimination_tests())
+           + lemma_shortcut_tests() + regular_elimination_tests()
+           + cache_tests())
     if verbose:
         for r in res:
             print("  " + str(r))

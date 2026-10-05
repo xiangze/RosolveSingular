@@ -46,6 +46,7 @@ PyTorch のモデルをそのまま読み込み、theta* (現在の重み) に�
 from __future__ import annotations
 
 import itertools
+import math
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -57,6 +58,8 @@ __all__ = [
     "TorchReport",
     "torch_local_rlct",
     "fiber_ideal_from_torch",
+    "transformer_star_from_torch",
+    "torch_transformer_rlct",
 ]
 
 
@@ -101,36 +104,96 @@ def _relu_like(slope):
     return handler
 
 
-def _analytic(fexpr):
-    """解析的な活性化: theta* の前活性化まわりでテイラー展開する。"""
+#: `_rat_rel` が係数を 0 に丸めたときの記録 (fiber_ideal_from_torch が拾う)
+_ROUNDING_NOTES: List[str] = []
+
+
+def _rat_rel(v, max_den: int) -> sp.Rational:
+    r"""**相対精度**を保って有理数に丸める。
+
+    `limit_denominator(max_den)` を絶対精度で使うと、小さな値が 0 に落ちる。
+    テイラー係数でこれが起きると致命的で、たとえば前活性化が大きい tanh の
+    1 次係数 `1 - tanh(z0)^2` が `max_den=16` で 0 に丸まり、**活性化が定数に
+    なって上流のパラメータが全部「自由方向」に見える** (lambda が偽の 0 になる)。
+    実際にこれで CNN の lambda が 0 と出た。
+
+    そこで `|v| < 1` のときは分母の上限を `1/|v|` 倍まで引き上げ、有効桁を
+    保つ。
+
+    分母は `max_den * 10**9` で打ち止めにする。tanh の導関数は `e^{-2|z0|}` で
+    減るので、前活性化が ±10 程度までは厳密に表せる。これより小さい係数は 0 に
+    落ちる (= 飽和したユニット) が、黙って落とすと lambda が不連続に変わるので
+    `_ROUNDING_NOTES` に記録して meta から見えるようにする。
+    """
+    v = float(v)
+    if v == 0.0:
+        return sp.Integer(0)
+    scale = int(math.ceil(1.0 / abs(v))) if abs(v) < 1.0 else 1
+    cap = max_den * 10 ** 9
+    out = sp.Rational(v).limit_denominator(min(max(max_den, max_den * scale),
+                                               cap))
+    if out == 0:
+        _ROUNDING_NOTES.append(
+            f"活性化のテイラー係数 {v:.3e} が 0 に丸められました "
+            f"(飽和したユニット)。lambda はこの方向を自由方向として扱います")
+    return out
+
+
+def _analytic(fexpr, max_den: int = 10 ** 6):
+    r"""解析的な活性化: theta\* の前活性化まわりでテイラー展開する。
+
+    **展開の中心は `sym` の定数項そのもの** (= theta\* での前活性化の厳密な
+    有理数) に取る。float を `nsimplify` して中心にすると、theta\* で
+    `delta != 0` の端数が残り、生成元が theta\* でぴったり 0 にならない。
+
+    テイラー係数は `limit_denominator(max_den)` で**有理数に丸める**。丸めない
+    と `tanh(1180339/2500000)` のような超越数が係数に残り、以降の多項式演算が
+    拡大体 (sympy の EX ドメイン) に落ちて桁違いに遅くなる (実測 10 分以上で
+    終わらず → 丸めれば 1 秒未満)。丸めた 0 次係数をそのまま数値側にも返すので、
+    **記号側と数値側は厳密に一致**する (softmax の `e*` と同じ扱い)。
+    """
     z = sp.Symbol("_z")
     f = fexpr(z)
 
     def handler(sym, num, sign, order):
-        z0 = sp.nsimplify(num)
+        sym = sp.sympify(sym)
+        sym = sp.expand(sym)
+        # theta* での前活性化 = sym の定数項 (自由記号は u 変数しかない)
+        z0 = sym.subs({s: 0 for s in sym.free_symbols}) if sym.free_symbols \
+            else sym
+        if not z0.is_Rational:
+            # 丸めた重みで計算しているので普通は有理数。float が漏れていた
+            # ときだけここに来る (nsimplify を素で呼ぶと 2**(232/265) のような
+            # 無理数を返してくるので rational=True を外さない)
+            z0 = sp.nsimplify(z0, rational=True)
         delta = sp.expand(sym - z0)
         val = sp.Integer(0)
         der = f
+        c0 = None
         for k in range(order + 1):
-            coeff = der.subs(z, z0)
-            val += sp.nsimplify(coeff) / sp.factorial(k) * delta ** k
+            c = _rat_rel(float(der.subs(z, z0)), max_den)
+            if k == 0:
+                c0 = c
+            val += c / sp.factorial(k) * delta ** k
             der = sp.diff(der, z)
-        return sp.expand(val), float(f.subs(z, z0))
+        return sp.expand(val), float(c0)
     return handler
 
 
-def _default_handlers():
+def _default_handlers(max_den: int = 10 ** 6):
     import torch.nn as nn
 
     h = {
         nn.ReLU: lambda m: _relu_like(0),
         nn.LeakyReLU: lambda m: _relu_like(sp.nsimplify(m.negative_slope)),
-        nn.Tanh: lambda m: _analytic(sp.tanh),
-        nn.Sigmoid: lambda m: _analytic(lambda z: 1 / (1 + sp.exp(-z))),
-        nn.Softplus: lambda m: _analytic(lambda z: sp.log(1 + sp.exp(z))),
-        nn.SiLU: lambda m: _analytic(lambda z: z / (1 + sp.exp(-z))),
+        nn.Tanh: lambda m: _analytic(sp.tanh, max_den),
+        nn.Sigmoid: lambda m: _analytic(lambda z: 1 / (1 + sp.exp(-z)), max_den),
+        nn.Softplus: lambda m: _analytic(
+            lambda z: sp.log(1 + sp.exp(z)), max_den),
+        nn.SiLU: lambda m: _analytic(
+            lambda z: z / (1 + sp.exp(-z)), max_den),
         nn.GELU: lambda m: _analytic(
-            lambda z: z * (1 + sp.erf(z / sp.sqrt(2))) / 2),
+            lambda z: z * (1 + sp.erf(z / sp.sqrt(2))) / 2, max_den),
     }
     return h
 
@@ -177,11 +240,23 @@ class _Sym:
         return star + self.symbols[key], star
 
     # --- 1 サンプルの前向き計算 (記号 + 数値を並行して持つ) -----------
-    def forward(self, x_row, name_of, signs, record_signs=None):
+    def forward(self, x_row, name_of, signs, record_signs=None, shape=None):
+        """1 データ点の記号フォワード。
+
+        shape を渡すと (C, H, W) として扱い、Conv2d / プーリングを通せる。
+        中身は常に平坦なリストで持ち、index(c,h,w) = (c*H + h)*W + w。
+        """
         sym = [sp.Rational(float(v)).limit_denominator(self.max_den) for v in x_row]
         num = [float(v) for v in x_row]
+        shp = tuple(shape) if shape else None
         for li, layer in enumerate(self.layers):
-            if isinstance(layer, self.nn.Linear):
+            if isinstance(layer, self.nn.Conv2d):
+                sym, num, shp = self._conv2d(layer, sym, num, shp, name_of)
+            elif isinstance(layer, (self.nn.MaxPool2d, self.nn.AvgPool2d,
+                                    self.nn.AdaptiveAvgPool2d)):
+                sym, num, shp = self._pool(layer, li, sym, num, shp,
+                                           signs, record_signs)
+            elif isinstance(layer, self.nn.Linear):
                 W, b = layer.weight, layer.bias
                 out_s, out_n = [], []
                 wname = name_of.get(id(W), None)
@@ -201,6 +276,7 @@ class _Sym:
                     out_n.append(float(n))
                 sym, num = out_s, out_n
             elif isinstance(layer, (self.nn.Identity, self.nn.Flatten)):
+                shp = None                      # 以降は平坦な (d,) として扱う
                 continue
             else:
                 key = type(layer)
@@ -226,6 +302,120 @@ class _Sym:
                     out_n.append(n)
                 sym, num = out_s, out_n
         return sym, num
+
+    # --- Conv2d / プーリング --------------------------------------------
+    def _conv2d(self, layer, sym, num, shp, name_of):
+        """Conv2d を記号で通す。線形なので entry() の線形結合でよい。
+
+        dilation / groups は 1 のみ。padding は整数か 'same'/'valid'。
+        """
+        if shp is None:
+            raise ValueError("Conv2d を通すには入力の形 (C, H, W) が必要です "
+                             "(input_shape= を指定してください)。")
+        C, Hh, Ww = shp
+        W, b = layer.weight, layer.bias
+        OC, IC, kh, kw = W.shape
+        if IC != C:
+            raise ValueError(f"Conv2d の入力チャネルが合いません ({IC} != {C})")
+        if layer.groups != 1 or tuple(layer.dilation) != (1, 1):
+            raise NotImplementedError("Conv2d は groups=1, dilation=1 のみ対応")
+        sh, sw = layer.stride
+        pad = layer.padding
+        if isinstance(pad, str):
+            pad = ((kh - 1) // 2, (kw - 1) // 2) if pad == "same" else (0, 0)
+        ph, pw = pad
+        OH = (Hh + 2 * ph - kh) // sh + 1
+        OW = (Ww + 2 * pw - kw) // sw + 1
+        wname = name_of.get(id(W), None)
+        bname = name_of.get(id(b), None) if b is not None else None
+        out_s = [sp.Integer(0)] * (OC * OH * OW)
+        out_n = [0.0] * (OC * OH * OW)
+        for oc in range(OC):
+            for oy in range(OH):
+                for ox in range(OW):
+                    acc_s = sp.Integer(0)
+                    acc_n = 0.0
+                    for ic in range(IC):
+                        for ky in range(kh):
+                            iy = oy * sh - ph + ky
+                            if iy < 0 or iy >= Hh:
+                                continue
+                            for kx in range(kw):
+                                ix = ox * sw - pw + kx
+                                if ix < 0 or ix >= Ww:
+                                    continue
+                                ws, wn = self.entry(wname, W, (oc, ic, ky, kx))
+                                idx = (ic * Hh + iy) * Ww + ix
+                                acc_s += ws * sym[idx]
+                                acc_n += wn * num[idx]
+                    if b is not None:
+                        bs, bn = self.entry(bname, b, (oc,))
+                        acc_s += bs
+                        acc_n += float(bn)
+                    o = (oc * OH + oy) * OW + ox
+                    out_s[o] = sp.expand(acc_s)
+                    out_n[o] = float(acc_n)
+        return out_s, out_n, (OC, OH, OW)
+
+    def _pool(self, layer, li, sym, num, shp, signs, record_signs):
+        """プーリング。
+
+        AvgPool は線形なのでそのまま。**MaxPool は theta* での argmax を
+        固定する** (ReLU のセル固定と同じ考え方)。同点のときはどの枝を取っても
+        近傍では別のセルになるので、得られる lambda は真値の下界になる。
+        """
+        if shp is None:
+            raise ValueError("プーリングには入力の形 (C, H, W) が必要です。")
+        C, Hh, Ww = shp
+        is_max = isinstance(layer, self.nn.MaxPool2d)
+        if isinstance(layer, self.nn.AdaptiveAvgPool2d):
+            osz = layer.output_size
+            osz = (osz, osz) if isinstance(osz, int) else osz
+            if tuple(osz) != (1, 1):
+                raise NotImplementedError(
+                    "AdaptiveAvgPool2d は output_size=1 のみ対応")
+            kh, kw, sh, sw, ph, pw = Hh, Ww, Hh, Ww, 0, 0
+        else:
+            k = layer.kernel_size
+            kh, kw = (k, k) if isinstance(k, int) else k
+            st = layer.stride if layer.stride is not None else k
+            sh, sw = (st, st) if isinstance(st, int) else st
+            pd = layer.padding
+            ph, pw = (pd, pd) if isinstance(pd, int) else pd
+        OH = (Hh + 2 * ph - kh) // sh + 1
+        OW = (Ww + 2 * pw - kw) // sw + 1
+        out_s = [sp.Integer(0)] * (C * OH * OW)
+        out_n = [0.0] * (C * OH * OW)
+        for c in range(C):
+            for oy in range(OH):
+                for ox in range(OW):
+                    cells = []
+                    for ky in range(kh):
+                        iy = oy * sh - ph + ky
+                        if iy < 0 or iy >= Hh:
+                            continue
+                        for kx in range(kw):
+                            ix = ox * sw - pw + kx
+                            if ix < 0 or ix >= Ww:
+                                continue
+                            cells.append((ic_idx := (c * Hh + iy) * Ww + ix))
+                    o = (c * OH + oy) * OW + ox
+                    if not cells:
+                        continue
+                    if is_max:
+                        key = (li, o)
+                        pick = signs.get(key, None)
+                        if pick is None or pick not in cells:
+                            pick = max(cells, key=lambda t: num[t])
+                            if record_signs is not None:
+                                record_signs[key] = pick
+                        out_s[o] = sym[pick]
+                        out_n[o] = num[pick]
+                    else:
+                        out_s[o] = sp.expand(
+                            sum(sym[t] for t in cells) / sp.Integer(len(cells)))
+                        out_n[o] = sum(num[t] for t in cells) / len(cells)
+        return out_s, out_n, (C, OH, OW)
 
 
 # ----------------------------------------------------------------------
@@ -284,8 +474,20 @@ def fiber_ideal_from_torch(
     extra_handlers: Optional[Dict] = None,
     max_vars: int = 40,
     residual_tol: float = 1e-3,
+    loss: str = "regression",
+    input_shape: Optional[Sequence[int]] = None,
 ):
     """torch モデルから fiber ideal の生成元・変数・対称ベクトルを作る。
+
+    loss :
+      'regression'     : g = f_c(theta) - f_c(theta*)  (二乗誤差のモデル)
+      'classification' : softmax + 交差エントロピーのモデル。
+          p(y|x,theta) = softmax(f(x;theta)) が theta* と一致するのは
+          **ロジットの差が一致するとき**なので、基準クラス C を 1 つ選び
+              g_{i,c} = (f_c - f_C)(theta) - (f_c - f_C)(theta*),  c != C
+          を生成元にする。ロジット全体の平行移動 f -> f + const は p を
+          変えないので、その方向は対称性として渡す (出力バイアスの (1,..,1))。
+    input_shape : Conv2d / プーリングを通すときの入力の形 (C, H, W)。
 
     Returns
     -------
@@ -295,7 +497,8 @@ def fiber_ideal_from_torch(
     import torch.nn as nn
 
     layers = _flatten_layers(model)
-    handlers = _default_handlers()
+    del _ROUNDING_NOTES[:]          # このモデルの丸め記録だけを集める
+    handlers = _default_handlers(max_denominator)
     if extra_handlers:
         handlers.update(extra_handlers)
 
@@ -324,7 +527,8 @@ def fiber_ideal_from_torch(
         signs_per_sample: List[Dict[Tuple[int, int], int]] = []
         for row in Xl:
             rec: Dict[Tuple[int, int], int] = {}
-            S.forward(row, name_of, {}, record_signs=rec)
+            S.forward(row, name_of, {}, record_signs=rec,
+                      shape=input_shape)
             signs_per_sample.append(rec)
 
         boundary = [(i, l, u) for i, rec in enumerate(signs_per_sample)
@@ -339,7 +543,8 @@ def fiber_ideal_from_torch(
                 sgn_maps[i][(l, u)] = s
             gens = []
             for i, row in enumerate(Xl):
-                sym, num = S.forward(row, name_of, sgn_maps[i])
+                sym, num = S.forward(row, name_of, sgn_maps[i],
+                                     shape=input_shape)
                 zero = {u: 0 for u in S.u_vars}
                 # fiber ideal は「theta* のモデルが真」としたときの残差で定義される。
                 # targets が与えられた場合は theta* がその教師データのゼロ点に
@@ -350,8 +555,17 @@ def fiber_ideal_from_torch(
                     ti = ti if isinstance(ti, (list, tuple)) else [ti]
                     for yv, tv in zip(y, ti):
                         residual_check.append(abs(float(yv) - float(tv)))
-                for s_expr, y_val in zip(sym, y):
-                    gens.append(sp.expand(s_expr - y_val))
+                if loss == "classification":
+                    # 基準クラスとの差だけが識別可能
+                    ref = len(sym) - 1
+                    for c in range(len(sym)):
+                        if c == ref:
+                            continue
+                        gens.append(sp.expand((sym[c] - sym[ref])
+                                              - (y[c] - y[ref])))
+                else:
+                    for s_expr, y_val in zip(sym, y):
+                        gens.append(sp.expand(s_expr - y_val))
             return gens
 
         gens0 = build(tuple(-1 for _ in boundary))
@@ -381,6 +595,20 @@ def fiber_ideal_from_torch(
 
     # --- スケール対称性 (Linear -> 正斉次活性化 -> Linear) -------------
     sym_vecs, sym_units, skipped = [], [], []
+    if loss == "classification":
+        # ロジット全体の平行移動 f -> f + t は softmax を変えない。
+        # 最後の Linear の bias の (1,...,1) 方向がそれ。
+        lin_all = [l for l in layers if isinstance(l, nn.Linear)]
+        if lin_all and lin_all[-1].bias is not None:
+            bn = name_of.get(id(lin_all[-1].bias), None)
+            if bn is not None:
+                vec = {}
+                for j in range(lin_all[-1].bias.shape[0]):
+                    u = S.symbols.get((bn, (j,)))
+                    if u is not None:
+                        vec[u] = sp.Integer(1)
+                if len(vec) >= 2:
+                    sym_vecs.append(vec)
     lin_idx = [i for i, l in enumerate(layers) if isinstance(l, nn.Linear)]
     for a, b in zip(lin_idx, lin_idx[1:]):
         between = [l for l in layers[a + 1:b]
@@ -432,6 +660,7 @@ def fiber_ideal_from_torch(
         build=build, boundary=boundary, signs_per_sample=signs_per_sample,
         dead_units=dead, var_names=var_names, frozen=frozen,
         symmetry_units=sym_units, skipped=skipped, layers=layers,
+        rounding_notes=sorted(set(_ROUNDING_NOTES)),
     )
     return dict(generators=gens0, variables=list(S.u_vars),
                 symmetry_vectors=sym_vecs, meta=meta)
@@ -449,6 +678,8 @@ def torch_local_rlct(
     extra_handlers: Optional[Dict] = None,
     max_vars: int = 40,
     residual_tol: float = 1e-3,
+    loss: str = "regression",
+    input_shape: Optional[Sequence[int]] = None,
     boundary: str = "both",
     max_cells: int = 32,
     verbose: bool = False,
@@ -465,9 +696,12 @@ def torch_local_rlct(
                None なら全部だが、max_vars を超えると例外。
     zero_tol : この絶対値以下の重みは 0 に丸める (退化点を見るため)
     boundary : 前活性化が 0 の箇所の扱い ('both' / 'active' / 'inactive')
+    loss     : 'regression' か 'classification' (fiber_ideal_from_torch 参照)
+    input_shape : Conv2d / プーリングを通すときの入力の形 (C, H, W)
     """
     data = fiber_ideal_from_torch(
         model, X, targets=targets, params=params, zero_tol=zero_tol,
+        loss=loss, input_shape=input_shape,
         max_denominator=max_denominator, taylor_order=taylor_order,
         extra_handlers=extra_handlers, max_vars=max_vars,
         residual_tol=residual_tol)
@@ -481,7 +715,13 @@ def torch_local_rlct(
     elif boundary == "inactive":
         assigns = [tuple(-1 for _ in bnd)]
     else:
-        assigns = list(itertools.product((1, -1), repeat=len(bnd)))[:max_cells]
+        # islice で**打ち切ってから**materialize する。list(product(...)) を
+        # 先に作ると境界ユニットが 30 本あるだけで 2^30 タプルを並べようとして
+        # MemoryError になる (深い ReLU CNN で実際に落ちた)。
+        assigns = list(itertools.islice(
+            itertools.product((1, -1), repeat=len(bnd)), max_cells))
+    truncated = (boundary == "both" and len(bnd) > 0
+                 and 2 ** len(bnd) > len(assigns))
 
     def run(assign):
         return local_rlct_from_ideal(
@@ -496,6 +736,17 @@ def torch_local_rlct(
         for a in assigns:
             cells.append((a, run(a)))
         local = min(cells, key=lambda t: (float(t[1].rlct), -t[1].multiplicity))[1]
+
+    if truncated:
+        # min を取ったセルが全部ではないので、得られた値は「全セルの min」
+        # より大きいかもしれない。下界として使えなくなる向きなので明記する。
+        local.notes.append(
+            f"[warn] 境界ユニットが {len(bnd)} 本あり、セルを "
+            f"{len(assigns)}/{2 ** len(bnd)} 個だけ調べた。lambda は"
+            "**一部のセルでの min** であり、全セルの min より大きい可能性がある "
+            "(max_cells を上げるか boundary='active'/'inactive' を指定のこと)")
+    for n in meta.get("rounding_notes", ()):
+        local.notes.append(f"[warn] {n}")
 
     if targets is not None:
         local.notes.append(
@@ -526,6 +777,184 @@ def torch_local_rlct(
 # ----------------------------------------------------------------------
 # デモ
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Transformer 1 層 (Self-Attention + 残差 + MLP(ReLU) + 残差)
+# ----------------------------------------------------------------------
+def transformer_star_from_torch(layer, *, n_heads: Optional[int] = None,
+                                zero_tol: float = 1e-8,
+                                max_denominator: int = 10 ** 4,
+                                layernorm: str = "error"):
+    """torch の層から theta* (有理数) を取り出す。
+
+    受け付ける形:
+      * ``nn.TransformerEncoderLayer``
+      * ``dict`` で ``Wq,bq,Wk,bk,Wv,bv,Wo,bo,W1,b1,W2,b2`` を直接渡す
+        (形は transformer_rlct.TransformerStar と同じ; torch テンソルでも可)
+
+    LayerNorm は多項式にならず (1/sqrt)、さらにスケール対称性が増えるので
+    **既定では扱わない**。LayerNorm を持つ層を渡したときは、
+    ``layernorm="ignore"`` を明示しない限りエラーにする (黙って別のモデルを
+    計算しないため)。
+
+    ``nn.TransformerEncoderLayer`` の in_proj_weight は (3d, d) に Q,K,V が
+    縦に積まれており、行が出力側・列が入力側なので、こちらの規約
+    ``Q = X W_Q`` に合わせて転置してから H 個のヘッドに切り分ける。
+    """
+    import torch
+    import torch.nn as nn
+
+    from transformer_rlct import TransformerStar
+
+    def R(v):
+        return _rat(float(v), zero_tol, max_denominator)
+
+    if isinstance(layer, dict):
+        g = {k: v for k, v in layer.items()}
+        d_model = len(g["bo"])
+        d_att = len(g["Wo"])
+        H = n_heads or 1
+        d_k = d_att // H
+        d_ff = len(g["b1"])
+
+        def M(t):
+            return [[R(x) for x in row] for row in t]
+
+        def V(t):
+            return [R(x) for x in t]
+        st = TransformerStar(d_model=d_model, d_k=d_k, d_ff=d_ff, n_heads=H)
+        for nm in ("Wq", "Wk", "Wv"):
+            blocks = g[nm]
+            # [H][d_model][d_k] でも [d_model][H*d_k] でも受ける
+            if H == 1 and not isinstance(blocks[0][0], (list, tuple)):
+                setattr(st, nm, [M(blocks)])
+            else:
+                setattr(st, nm, [M(b) for b in blocks])
+        for nm in ("bq", "bk", "bv"):
+            blocks = g[nm]
+            if H == 1 and not isinstance(blocks[0], (list, tuple)):
+                setattr(st, nm, [V(blocks)])
+            else:
+                setattr(st, nm, [V(b) for b in blocks])
+        st.Wo, st.bo = M(g["Wo"]), V(g["bo"])
+        st.W1, st.b1 = M(g["W1"]), V(g["b1"])
+        st.W2, st.b2 = M(g["W2"]), V(g["b2"])
+        return st
+
+    # nn.TransformerEncoderLayer そのものでなくても、同じ部品名
+    # (self_attn / linear1 / linear2) を持つ層なら受け付ける
+    # (train_rlct.TinyViT の LayerNorm なし層など)。
+    duck = (hasattr(layer, "self_attn") and hasattr(layer, "linear1")
+            and hasattr(layer, "linear2"))
+    if not isinstance(layer, nn.TransformerEncoderLayer) and not duck:
+        raise TypeError("nn.TransformerEncoderLayer 相当の層 "
+                        "(self_attn / linear1 / linear2 を持つ) か dict を"
+                        f"渡してください (渡されたのは {type(layer).__name__})")
+    if getattr(layer, "activation", None) is not None:
+        act = layer.activation
+        ok = (act is torch.nn.functional.relu
+              or isinstance(act, nn.ReLU)
+              or getattr(act, "__name__", "") == "relu")
+        if not ok:
+            raise ValueError("activation が ReLU ではありません "
+                             f"({act})。ReLU の層を渡してください。")
+    has_ln = isinstance(getattr(layer, "norm1", None), nn.LayerNorm)
+    if has_ln and layernorm != "ignore":
+        raise ValueError(
+            "この層は LayerNorm を含みます。LayerNorm は 1/sqrt が入って"
+            "多項式にならず、スケール対称性も増えるのでここでは扱いません。"
+            'layernorm="ignore" を明示すると LayerNorm を外した層として'
+            "計算します (別のモデルの lambda になります)。")
+
+    attn = layer.self_attn
+    d_model = attn.embed_dim
+    H = n_heads or attn.num_heads
+    d_k = d_model // H
+    Win = attn.in_proj_weight.detach()            # (3d, d)
+    bin_ = (attn.in_proj_bias.detach()
+            if attn.in_proj_bias is not None else torch.zeros(3 * d_model))
+    Wq_all = Win[:d_model].t()                    # (d, d)  X W_Q の規約に合わせる
+    Wk_all = Win[d_model:2 * d_model].t()
+    Wv_all = Win[2 * d_model:].t()
+    bq_all = bin_[:d_model]
+    bk_all = bin_[d_model:2 * d_model]
+    bv_all = bin_[2 * d_model:]
+
+    def heads_W(Wall):
+        return [[[_rat(float(Wall[i][h * d_k + r]), zero_tol, max_denominator)
+                  for r in range(d_k)] for i in range(d_model)]
+                for h in range(H)]
+
+    def heads_b(ball):
+        return [[_rat(float(ball[h * d_k + r]), zero_tol, max_denominator)
+                 for r in range(d_k)] for h in range(H)]
+
+    Wo_t = attn.out_proj.weight.detach().t()      # (d_att, d)
+    bo_t = (attn.out_proj.bias.detach()
+            if attn.out_proj.bias is not None else torch.zeros(d_model))
+    W1_t = layer.linear1.weight.detach().t()      # (d, d_ff)
+    b1_t = layer.linear1.bias.detach()
+    W2_t = layer.linear2.weight.detach().t()      # (d_ff, d)
+    b2_t = layer.linear2.bias.detach()
+
+    from transformer_rlct import TransformerStar
+    st = TransformerStar(d_model=d_model, d_k=d_k,
+                         d_ff=W1_t.shape[1], n_heads=H)
+    st.Wq, st.Wk, st.Wv = heads_W(Wq_all), heads_W(Wk_all), heads_W(Wv_all)
+    st.bq, st.bk, st.bv = heads_b(bq_all), heads_b(bk_all), heads_b(bv_all)
+    st.Wo = [[_rat(float(v), zero_tol, max_denominator) for v in row]
+             for row in Wo_t]
+    st.bo = [_rat(float(v), zero_tol, max_denominator) for v in bo_t]
+    st.W1 = [[_rat(float(v), zero_tol, max_denominator) for v in row]
+             for row in W1_t]
+    st.b1 = [_rat(float(v), zero_tol, max_denominator) for v in b1_t]
+    st.W2 = [[_rat(float(v), zero_tol, max_denominator) for v in row]
+             for row in W2_t]
+    st.b2 = [_rat(float(v), zero_tol, max_denominator) for v in b2_t]
+    return st
+
+
+def torch_transformer_rlct(layer, X, *, targets=None, n_heads=None,
+                           taylor_order: int = 1, scale=None,
+                           zero_tol: float = 1e-8,
+                           max_denominator: int = 10 ** 4,
+                           layernorm: str = "error",
+                           verbose: bool = False, **resolve_kwargs):
+    """torch の Transformer 1 層の theta* における局所 RLCT。
+
+        import torch.nn as nn
+        layer = nn.TransformerEncoderLayer(d_model=2, nhead=1,
+                                           dim_feedforward=2,
+                                           activation="relu",
+                                           batch_first=True)
+        rep = torch_transformer_rlct(layer, X, layernorm="ignore")
+        rep.print_report()
+
+    X は (T x d_model) のリストか torch テンソル。targets を省くと
+    realizable (真の関数 = theta* の層) とみなす。
+    """
+    from transformer_rlct import transformer_local_rlct
+
+    st = transformer_star_from_torch(layer, n_heads=n_heads,
+                                     zero_tol=zero_tol,
+                                     max_denominator=max_denominator,
+                                     layernorm=layernorm)
+    try:
+        Xl = [[float(v) for v in row] for row in X]
+    except TypeError:
+        Xl = [[float(v) for v in row] for row in X.detach()]
+    Xr = [[_rat(v, zero_tol, max_denominator) for v in row] for row in Xl]
+    tg = None
+    if targets is not None:
+        try:
+            tl = [[float(v) for v in row] for row in targets]
+        except TypeError:
+            tl = [[float(v) for v in row] for row in targets.detach()]
+        tg = [[_rat(v, zero_tol, max_denominator) for v in row] for row in tl]
+    return transformer_local_rlct(Xr, st, taylor_order=taylor_order,
+                                  targets=tg, scale=scale, verbose=verbose,
+                                  **resolve_kwargs)
+
+
 def _demo():
     import torch
     import torch.nn as nn

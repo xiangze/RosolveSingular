@@ -14,6 +14,7 @@ proved の割合を上げる作業は、判定を正しく直すことでも、�
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass
 from typing import List
 
@@ -635,12 +636,623 @@ def cache_tests() -> List[GuardResult]:
     return out
 
 
+def relu_case_tests() -> List[GuardResult]:
+    """ReLU ネットの新しい退化の型が、独立な計算と一致するか。
+
+    キャッシュに貯めるケースを増やすために退化の型を足した
+    (duplicate3 / pair / opposite / scaled)。型を足すことで
+      * 式が壊れていないか
+      * 正則消去を通した lambda が、コア K = sum g_i^2 を直接解いた値と
+        一致するか
+    を確かめる。コアが空のケースは比べるものが無いので飛ばす。
+    """
+    from certify import rlct_certified
+    from nn_cases import case_from_spec
+    from nn_rlct import local_rlct_from_ideal
+
+    # コアが**非空**になる組合せを選んでいる (build_cache のスイープで実測)。
+    # コアが空だと比較対象が無く検査が空回りするため。
+    specs = [((1, 3, 1), "redundant", 10, 0),      # core=4
+             ((1, 3, 1), "redundant", 10, 3),      # core=2
+             ((1, 2, 1), "redundant", 10, 2),      # core=2
+             ((1, 3, 1), "dead", 10, 3),           # core=2
+             ((1, 2, 1), "dead", 10, 1),           # core=1
+             ((1, 3, 1), "duplicate3", 10, 0),
+             ((1, 4, 1), "pair", 10, 0),
+             ((1, 2, 1), "opposite", 10, 0),
+             ((1, 2, 1), "scaled", 10, 0)]
+    out: List[GuardResult] = []
+    for spec in specs:
+        label = f"{spec[1]} {'-'.join(map(str, spec[0]))}"
+        c = case_from_spec(spec)
+        if c is None:
+            out.append(GuardResult(f"relu: {label} のケースが作れる", False,
+                                   "生成元が空"))
+            continue
+        out.append(GuardResult(f"relu: {label} のケースが作れる", True,
+                               f"{len(c.generators)} 生成元, "
+                               f"{len(c.variables)} 変数"))
+        try:
+            loc = local_rlct_from_ideal(c.generators, c.variables,
+                                        symmetry_vectors=c.symmetries,
+                                        max_depth=8)
+        except Exception as e:                        # noqa: BLE001
+            out.append(GuardResult(f"relu: {label} の lambda が独立計算と一致",
+                                   False, f"error:{type(e).__name__}"))
+            continue
+        if not loc.core_gens:
+            out.append(GuardResult(
+                f"relu: {label} の lambda が独立計算と一致", True,
+                f"コアが空 (lambda={loc.rlct}) なので比較対象なし"))
+            continue
+        K = sp.expand(sum(g ** 2 for g in loc.core_gens))
+        try:
+            lam_ref, st_ref, _ = rlct_certified(K, tuple(loc.core_vars),
+                                                generators=list(loc.core_gens),
+                                                timeout_ms=5000, max_depth=12)
+        except Exception as e:                        # noqa: BLE001
+            lam_ref, st_ref = None, f"error:{type(e).__name__}"
+        ok = (st_ref != "proved") or (lam_ref == loc.lam_core)
+        out.append(GuardResult(
+            f"relu: {label} の lambda が独立計算と一致", ok,
+            f"コア {len(loc.core_vars)} 変数: 消去経由 {loc.lam_core} / "
+            f"直接 {lam_ref} ({st_ref}),  全体 lambda={loc.rlct}"))
+    return out
+
+
+def transformer_tests() -> List[GuardResult]:
+    """Transformer 1 層の fiber ideal と対称性が正しく作れているか。
+
+    softmax は分母を払って多項式にしているので、次の 2 つが要となる。
+
+      (1) 生成元が theta* でぴったり 0 になること。
+          exp(S*) を有理数に丸めているが、記号側と数値側で**同じ丸め値**を
+          使っているので、丸め誤差が残差として漏れてはいけない。
+      (2) 主張している対称性が本当に対称性であること。
+          軌道の接ベクトル方向の方向微分が theta* で 0 になるかを、
+          生成元ごとに確かめる。QK ゲージ・VO ゲージ・softmax のシフト
+          不変性・ReLU の正斉次性のどれかを取り違えていればここで落ちる。
+    """
+    from transformer_rlct import random_layer, transformer_layer_ideal
+
+    X = [[sp.Rational(1), sp.Rational(0)], [sp.Rational(0), sp.Rational(1)]]
+    # (d_model, d_k, d_ff, n_heads, 退化, softmax の打ち切り次数)
+    # 形は小さく保つ。多頭は行の分母がヘッドの積になって次数が倍になり、
+    # H=2 / order=1 では生成元が 14528 項まで膨らんだ (H=1 なら 101 項)。
+    # そこで多頭は order=0 (注意を theta* で凍結) で形と VO ゲージだけ見る。
+    shapes = [(2, 1, 1, 1, "none", 1), (2, 1, 2, 1, "none", 1),
+              (2, 2, 1, 1, "zero_ffn", 1), (2, 1, 1, 2, "none", 0)]
+    out: List[GuardResult] = []
+    for (d, dk, dff, H, deg, order) in shapes:
+        label = f"d{d} k{dk} ff{dff} H{H} {deg} o{order}"
+        Xd = [[sp.Rational((i + j) % 3 - 1) for j in range(d)]
+              for i in range(len(X))]
+        star = random_layer(d_model=d, d_k=dk, d_ff=dff, n_heads=H, seed=0,
+                            degeneracy=deg)
+        try:
+            I = transformer_layer_ideal(Xd, star, taylor_order=order)
+        except Exception as e:                        # noqa: BLE001
+            out.append(GuardResult(f"transformer: {label} を作れる", False,
+                                   f"{type(e).__name__}: {str(e)[:40]}"))
+            continue
+        out.append(GuardResult(
+            f"transformer: {label} を作れる", bool(I.generators),
+            f"パラメータ {I.meta['n_params']}, 生成元 {I.meta['n_gens']}, "
+            f"対称性 {I.meta['n_symmetries']}"))
+        # theta* で消えるか = 定数項が 0 か。多変数の subs は密な多項式で
+        # 非常に遅いので Poly の定数項を直接見る。
+        polys = [sp.Poly(g, *I.variables) for g in I.generators]
+        bad = [P for P in polys if P.coeff_monomial(1) != 0]
+        out.append(GuardResult(
+            f"transformer: {label} の生成元が theta* で消える",
+            not bad, f"消えない生成元 {len(bad)} 個"))
+        # 対称性の検証 (theta* での方向微分 = 0)
+        #
+        # g(eps*v) の eps^1 の係数が方向微分。全変数について sp.diff を
+        # 取るのは高くつくので **1 次の単項式だけを拾う**:
+        #   g = sum_m c_m u^m  ->  (d/d eps) g(eps v)|_0 = sum_{|m|=1} c_m v_m
+        # これで 1 生成元あたり O(項数) で済む。
+        lin = []
+        for P in polys:
+            d1 = {}
+            for mon, c in zip(P.monoms(), P.coeffs()):
+                if sum(mon) == 1:
+                    d1[I.variables[list(mon).index(1)]] = c
+            lin.append(d1)
+        nfail = 0
+        for vec in I.symmetry_vectors:
+            for d1 in lin:
+                dd = sum(sp.nsimplify(c) * d1.get(v, 0)
+                         for v, c in vec.items() if c != 0)
+                if sp.nsimplify(dd) != 0:
+                    nfail += 1
+                    break
+        out.append(GuardResult(
+            f"transformer: {label} の対称性が本当に対称性",
+            nfail == 0,
+            f"方向微分が 0 でない {nfail}/{len(I.symmetry_vectors)} 方向"))
+    return out
+
+
+def transformer_torch_tests() -> List[GuardResult]:
+    """torch の層からの読み込み (torch が無ければ飛ばす)。"""
+    out: List[GuardResult] = []
+    try:
+        import torch
+        import torch.nn as nn
+    except Exception:
+        return out
+    from torch_rlct import transformer_star_from_torch
+
+    torch.manual_seed(0)
+    layer = nn.TransformerEncoderLayer(d_model=2, nhead=1, dim_feedforward=2,
+                                       activation="relu", dropout=0.0,
+                                       batch_first=True)
+    # LayerNorm を持つ層は既定で拒否する (黙って別のモデルを計算しない)
+    refused = False
+    try:
+        transformer_star_from_torch(layer)
+    except ValueError:
+        refused = True
+    out.append(GuardResult("transformer: LayerNorm 付きは既定で拒否",
+                           refused, "layernorm='ignore' が要る"))
+    st = transformer_star_from_torch(layer, layernorm="ignore")
+    shape_ok = (st.d_model == 2 and st.d_k == 2 and st.d_ff == 2
+                and st.n_heads == 1
+                and len(st.Wq[0]) == 2 and len(st.Wq[0][0]) == 2
+                and len(st.Wo) == 2 and len(st.W1) == 2
+                and len(st.W2) == 2)
+    out.append(GuardResult("transformer: torch から形どおり読める", shape_ok,
+                           f"d={st.d_model} dk={st.d_k} ff={st.d_ff} "
+                           f"H={st.n_heads}"))
+    # 重みが転置されずに入っていないか: X W_Q の規約に合わせて転置している
+    Win = layer.self_attn.in_proj_weight.detach()
+    ok_t = abs(float(Win[0][1]) - float(st.Wq[0][1][0])) < 1e-3
+    out.append(GuardResult("transformer: in_proj_weight を転置して読む", ok_t,
+                           f"W[0][1]={float(Win[0][1]):.4f} -> "
+                           f"Wq[1][0]={float(st.Wq[0][1][0]):.4f}"))
+    # tanh 活性の層は拒否する
+    layer2 = nn.TransformerEncoderLayer(d_model=2, nhead=1, dim_feedforward=2,
+                                        activation="gelu", dropout=0.0,
+                                        batch_first=True)
+    bad_act = False
+    try:
+        transformer_star_from_torch(layer2, layernorm="ignore")
+    except ValueError:
+        bad_act = True
+    out.append(GuardResult("transformer: ReLU 以外の活性は拒否", bad_act, ""))
+    return out
+
+
+def torch_classifier_tests() -> List[GuardResult]:
+    """Conv2d / プーリングの記号フォワードと、分類の fiber ideal。
+
+    (1) **記号フォワードの数値が torch と一致するか**。Conv2d・MaxPool2d・
+        AvgPool2d を記号で通せるようにしたので、同じ重み・同じ入力で
+        torch の出力と突き合わせる。ここがずれていれば生成元が別のモデルの
+        ものになり、lambda も無意味になる。
+    (2) 分類の fiber ideal (ロジットの差) が回帰のものより**拘束が弱い**こと。
+        p = softmax(f) はロジットの平行移動で変わらないので、分類の lambda は
+        回帰の lambda 以下でなければならない。
+    (3) ロジットの平行移動が本当に対称性であること (方向微分 = 0)。
+    """
+    out: List[GuardResult] = []
+    try:
+        import torch
+        import torch.nn as nn
+    except Exception:
+        return out
+    import torch_rlct as TR
+    from torch_rlct import fiber_ideal_from_torch, torch_local_rlct
+    from train_rlct import MLPClassifier, SmallCNN, load_dataset, train
+
+    torch.manual_seed(0)
+    ds = load_dataset("synthetic", n=32, shape=(1, 4, 4), n_classes=3)
+    models = [("mlp", MLPClassifier(ds.shape, 3, hidden=(4,))),
+              ("cnn", SmallCNN(ds.shape, 3, channels=2, hidden=4))]
+    for label, model in models:
+        rep = train(model, ds, epochs=150, lr=0.05, seed=0)
+        out.append(GuardResult(f"torch: {label} が学習できる",
+                               rep.final_acc > 0.8,
+                               f"loss={rep.final_loss:.4f} "
+                               f"acc={rep.final_acc:.3f}"))
+        layers = TR._flatten_layers(model)
+        names = {id(p): n for n, p in model.named_parameters()}
+        S = TR._Sym(layers=layers, var_names=[], zero_tol=1e-12,
+                    max_den=10 ** 12, order=3,
+                    handlers=TR._default_handlers())
+        X = ds.X[:4]
+        with torch.no_grad():
+            ref = model(X)
+        worst = 0.0
+        for i in range(X.shape[0]):
+            sym, num = S.forward(X[i].reshape(-1).tolist(), names, {},
+                                 record_signs={}, shape=ds.shape)
+            for a, b in zip(num, ref[i].tolist()):
+                worst = max(worst, abs(a - b))
+        out.append(GuardResult(
+            f"torch: {label} の記号フォワードが torch と一致",
+            worst < 1e-4, f"最大差 {worst:.2e}"))
+
+    # (2)(3) 分類 vs 回帰
+    net = nn.Sequential(nn.Linear(2, 3), nn.ReLU(), nn.Linear(3, 3))
+    Xc = torch.tensor([[1., 0.], [0., 1.], [-1., .5], [.5, -1.]])
+    vals = {}
+    for loss in ("classification", "regression"):
+        r = torch_local_rlct(net, Xc, loss=loss,
+                             params=["2.weight", "2.bias"],
+                             max_denominator=16, max_depth=8)
+        vals[loss] = r.local.rlct
+    out.append(GuardResult(
+        "torch: 分類の lambda <= 回帰の lambda",
+        vals["classification"] <= vals["regression"],
+        f"分類 {vals['classification']} / 回帰 {vals['regression']}"))
+
+    data = fiber_ideal_from_torch(net, Xc, loss="classification",
+                                  params=["2.weight", "2.bias"],
+                                  max_denominator=16)
+    gens, variables = data["generators"], data["variables"]
+    shift = [v for v in data["symmetry_vectors"]
+             if all(c == 1 for c in v.values()) and len(v) >= 2]
+    ok_shift = bool(shift)
+    if ok_shift:
+        vec = shift[0]
+        for g in gens:
+            P = sp.Poly(g, *variables)
+            d1 = {}
+            for mon, c in zip(P.monoms(), P.coeffs()):
+                if sum(mon) == 1:
+                    d1[variables[list(mon).index(1)]] = c
+            if sp.nsimplify(sum(d1.get(v, 0) for v in vec)) != 0:
+                ok_shift = False
+                break
+    out.append(GuardResult("torch: ロジットの平行移動が対称性", ok_shift,
+                           f"対称ベクトル {len(shift)} 本"))
+    return out
+
+
+def vit_tests() -> List[GuardResult]:
+    """学習済み TinyViT からエンコーダ層を取り出せるか。"""
+    out: List[GuardResult] = []
+    try:
+        import torch
+    except Exception:
+        return out
+    from torch_rlct import transformer_star_from_torch
+    from train_rlct import TinyViT, load_dataset, train
+
+    torch.manual_seed(0)
+    ds = load_dataset("synthetic", n=24, shape=(1, 4, 4), n_classes=3)
+    vit = TinyViT(ds.shape, 3, patch=2, d_model=2, n_heads=1, d_ff=2,
+                  depth=1, layernorm=False)
+    rep = train(vit, ds, epochs=120, lr=0.05, seed=0)
+    out.append(GuardResult("vit: TinyViT が学習できる", rep.final_loss < 1.0,
+                           f"loss={rep.final_loss:.4f} acc={rep.final_acc:.3f}"))
+    with torch.no_grad():
+        Z = vit.forward_upto(ds.X[:1], 0)
+    out.append(GuardResult("vit: 層の入力トークン列が取れる",
+                           tuple(Z.shape) == (1, 5, 2), f"{tuple(Z.shape)}"))
+    # LayerNorm なしの層は layernorm 指定なしでも読める
+    st = transformer_star_from_torch(vit.layers[0])
+    out.append(GuardResult(
+        "vit: LayerNorm なしの層はそのまま読める",
+        st.d_model == 2 and st.d_ff == 2 and st.n_heads == 1,
+        f"d={st.d_model} dk={st.d_k} ff={st.d_ff}"))
+    # LayerNorm ありの層は拒否される
+    vit2 = TinyViT(ds.shape, 3, patch=2, d_model=2, n_heads=1, d_ff=2,
+                   depth=1, layernorm=True)
+    refused = False
+    try:
+        transformer_star_from_torch(vit2.layers[0])
+    except ValueError:
+        refused = True
+    out.append(GuardResult("vit: LayerNorm 入りの層は既定で拒否", refused, ""))
+    return out
+
+
+def taylor_sweep_tests() -> List[GuardResult]:
+    """softmax の打ち切り次数ごとの問題が正しく組めているか。
+
+    (1) どの次数でも生成元が theta* で消えること。
+        指数の丸めを記号側と数値側で共有しているので、ここが破れたら
+        「残差 = 丸め誤差」を解消していることになる。
+    (2) 分類ヘッドのロジット平行移動が本当に対称性であること。
+    (3) 同じ theta* で **分類の lambda <= 回帰の lambda** であること。
+        p = softmax(logit) は平行移動で変わらないので、分類のほうが
+        拘束が弱い。逆向きになっていたら ideal の組み方が誤り。
+    (4) 次数を上げると生成元の項数が増えること (打ち切りが効いている確認)。
+    """
+    from nn_rlct import local_rlct_from_ideal
+    from taylor_sweep import build_problem, random_sequences
+    from transformer_rlct import random_layer
+
+    out: List[GuardResult] = []
+    star = random_layer(d_model=2, d_k=1, d_ff=1, n_heads=1, seed=0)
+    Xs = random_sequences(1, 2, 2, seed=0)
+    terms = {}
+    lam = {}
+    for loss in ("regression", "classification"):
+        for order in (0, 1):
+            prob = build_problem(Xs, star, taylor_order=order, loss=loss,
+                                 n_classes=2, max_denominator=8)
+            polys = [sp.Poly(g, *prob.variables) for g in prob.generators]
+            bad = [P for P in polys if P.coeff_monomial(1) != 0]
+            out.append(GuardResult(
+                f"taylor: {loss} n={order} の生成元が theta* で消える",
+                not bad, f"消えない生成元 {len(bad)}/{len(polys)} 個"))
+            terms[(loss, order)] = max((len(P.monoms()) for P in polys),
+                                       default=0)
+            if loss == "classification":
+                # ロジットの平行移動 (ヘッドのバイアスの (1,..,1)) の検証
+                shift = [v for v in prob.symmetry_vectors
+                         if len(v) >= 2 and all(c == 1 for c in v.values())
+                         and all("hb" in str(k) for k in v)]
+                ok = bool(shift)
+                if ok:
+                    vec = shift[-1]
+                    for P in polys:
+                        d1 = {}
+                        for mon, c in zip(P.monoms(), P.coeffs()):
+                            if sum(mon) == 1:
+                                d1[prob.variables[list(mon).index(1)]] = c
+                        if sp.nsimplify(sum(d1.get(v, 0) for v in vec)) != 0:
+                            ok = False
+                            break
+                out.append(GuardResult(
+                    f"taylor: n={order} のロジット平行移動が対称性", ok,
+                    f"対称ベクトル {len(shift)} 本"))
+            # lambda を解くのは n=0 だけ。n>=1 は生成元が密になり
+            # ガードの中で解くと分単位かかる (掃引の役目なので任せる)。
+            if order == 0:
+                loc = local_rlct_from_ideal(
+                    prob.generators, prob.variables,
+                    symmetry_vectors=prob.symmetry_vectors, max_depth=6)
+                lam[(loss, order)] = loc.rlct
+    for order in (0,):
+        out.append(GuardResult(
+            f"taylor: n={order} で 分類 lambda <= 回帰 lambda",
+            lam[("classification", order)] <= lam[("regression", order)],
+            f"分類 {lam[('classification', order)]} / "
+            f"回帰 {lam[('regression', order)]}"))
+    out.append(GuardResult(
+        "taylor: 次数を上げると項数が増える",
+        terms[("regression", 1)] > terms[("regression", 0)],
+        f"n=0: {terms[('regression', 0)]} 項 -> "
+        f"n=1: {terms[('regression', 1)]} 項"))
+    return out
+
+
+def analytic_activation_tests() -> List[GuardResult]:
+    r"""tanh など解析的な活性化のテイラー展開が正しく組めているか。
+
+    (1) **係数が有理数に丸まっていること**。丸めないと
+        `tanh(1180339/2500000)` のような超越数が係数に残り、sympy の
+        多項式が拡大体 (EX ドメイン) に落ちて実測 10 分でも終わらなくなる。
+        ここは速度の話に見えて実は構造の話なので、係数の型を直接見る。
+    (2) **どの次数でも生成元が theta\* で消えること**。展開の中心を
+        float の `nsimplify` で取ると theta\* で端数が残り、
+        「残差 = 丸め誤差」を解消する羽目になる。中心は `sym` の定数項
+        そのもの (厳密な有理数) に取っている。
+    (3) 打ち切りモデルの theta\* での出力が torch と一致すること。
+        theta\* では delta = 0 なので、次数によらず一致するのが正しい。
+    (4) 次数を上げると生成元の項数が増えること (打ち切りが効いている確認)。
+    """
+    import torch
+    import torch.nn as nn
+
+    from torch_rlct import (_default_handlers, _flatten_layers, _Sym,
+                           fiber_ideal_from_torch)
+
+    out: List[GuardResult] = []
+    torch.manual_seed(0)
+    net = nn.Sequential(nn.Linear(2, 2), nn.Tanh(), nn.Linear(2, 1))
+    X = torch.randn(3, 2)
+    with torch.no_grad():
+        ref = net(X)
+    layers = _flatten_layers(net)
+    name_of = {id(p): n for n, p in net.named_parameters()}
+
+    terms = {}
+    for order in (1, 2, 3):
+        d = fiber_ideal_from_torch(net, X, taylor_order=order,
+                                   max_denominator=10 ** 6, zero_tol=1e-12)
+        polys = [sp.Poly(g, *d["variables"]) for g in d["generators"]]
+        # (1) 係数が全部有理数か
+        bad_c = [c for P in polys for c in P.coeffs() if not c.is_Rational]
+        out.append(GuardResult(
+            f"tanh: n={order} の係数が有理数 (EX ドメインに落ちない)",
+            not bad_c,
+            f"有理数でない係数 {len(bad_c)} 個"
+            + (f" 例 {str(bad_c[0])[:40]}" if bad_c else "")))
+        # (2) theta* で消えるか
+        bad0 = [P for P in polys if P.coeff_monomial(1) != 0]
+        out.append(GuardResult(
+            f"tanh: n={order} の生成元が theta* で消える", not bad0,
+            f"消えない生成元 {len(bad0)}/{len(polys)} 個"))
+        terms[order] = max((len(P.monoms()) for P in polys), default=0)
+        # (3) theta* での出力が torch と一致するか
+        S = _Sym(layers, [], 1e-12, 10 ** 6, order, _default_handlers(10 ** 6))
+        dev = 0.0
+        for i in range(X.shape[0]):
+            _, num = S.forward([float(v) for v in X[i]], name_of, {})
+            for c, v in enumerate(num):
+                dev = max(dev, abs(v - float(ref[i, c])))
+        out.append(GuardResult(
+            f"tanh: n={order} の theta* での出力が torch と一致",
+            dev < 1e-6, f"最大差 {dev:.2e}"))
+    out.append(GuardResult(
+        "tanh: 次数を上げると項数が増える",
+        terms[3] > terms[2] > terms[1],
+        f"n=1: {terms[1]} -> n=2: {terms[2]} -> n=3: {terms[3]} 項"))
+
+    # (5) 係数の丸めが lambda を動かさないこと。丸めは打ち切りに加わる
+    # もう 1 つの近似なので、分母の上限を振って値が動かないかを確かめる。
+    from torch_rlct import torch_local_rlct
+    lams = {}
+    for den in (8, 64, 10 ** 6):
+        lams[den] = torch_local_rlct(net, X, taylor_order=2,
+                                     max_denominator=den,
+                                     zero_tol=1e-9).local.rlct
+    out.append(GuardResult(
+        "tanh: 係数の丸めの粗さで lambda が変わらない",
+        len(set(lams.values())) == 1,
+        ", ".join(f"den={k}: {v}" for k, v in lams.items())))
+
+    # (6) **飽和したユニットでも依存関係が消えないこと**。前活性化を大きく
+    # すると tanh の 1 次係数は e^{-2|z0|} で小さくなる。絶対精度で丸めると
+    # これが 0 になり、上流のパラメータが全部「自由方向」に見えて lambda が
+    # 偽の 0 になる (実際に CNN でこれが起きた)。相対精度の丸めの回帰テスト。
+    deep = nn.Sequential(nn.Linear(1, 1), nn.Tanh(), nn.Linear(1, 1))
+    with torch.no_grad():
+        deep[0].weight.fill_(6.0)        # 前活性化 ~ 6 -> tanh' ~ 1.8e-05
+        deep[0].bias.fill_(0.0)
+        deep[2].weight.fill_(1.0)
+        deep[2].bias.fill_(0.0)
+    Xs = torch.ones(2, 1)
+    d = fiber_ideal_from_torch(deep, Xs, params=["0.weight", "0.bias"],
+                               taylor_order=1, max_denominator=16,
+                               zero_tol=1e-12, max_vars=8)
+    nz = [g for g in d["generators"] if g != 0]
+    out.append(GuardResult(
+        "tanh: 飽和したユニットでも上流への依存が消えない (丸めが相対精度)",
+        len(nz) == len(d["generators"]) and len(nz) > 0,
+        f"非零の生成元 {len(nz)}/{len(d['generators'])} 本"
+        f" (tanh' ~ {1 - math.tanh(6.0) ** 2:.1e})"))
+    return out
+
+
+def cnn_depth_tests() -> List[GuardResult]:
+    r"""層数を変えられる CNN と、その掃引の組み方の検査。
+
+    (1) `DeepCNN` が偶数カーネルでも形を正しく追えること。padding で
+        一辺を保てるのは奇数カーネルだけなので、ここを間違えると
+        Flatten のあとの Linear が合わずに torch が例外を出す。
+    (2) 記号フォワードが torch と一致すること (ReLU・層数ごと)。
+    (3) `params='conv'` が層数を変えても**同じ変数集合**を選ぶこと。
+        これが崩れると「層数を変えた比較」が別の部分空間の比較になる。
+    (4) 同じ theta\* で 分類 lambda <= 回帰 lambda。
+    """
+    import torch
+    import torch.nn as nn
+
+    from cnn_sweep import _params_for
+    from torch_rlct import fiber_ideal_from_torch, torch_local_rlct
+    from train_rlct import DeepCNN, synthetic_classification
+
+    out: List[GuardResult] = []
+
+    # (1) 形
+    shapes_ok, note = True, []
+    for k in (2, 3):
+        for d in (1, 2, 3):
+            try:
+                m = DeepCNN((1, 8, 8), 2, depth=d, channels=2, hidden=4,
+                            kernel=k)
+                y = m(torch.randn(2, 1, 8, 8))
+                if tuple(y.shape) != (2, 2):
+                    shapes_ok = False
+                    note.append(f"k={k} d={d} -> {tuple(y.shape)}")
+            except Exception as e:                        # noqa: BLE001
+                shapes_ok = False
+                note.append(f"k={k} d={d}: {type(e).__name__}")
+    out.append(GuardResult("cnn: DeepCNN が偶数/奇数カーネルで形を追える",
+                           shapes_ok, ", ".join(note) or "k=2,3 x depth=1,2,3"))
+
+    # (3) params='conv' が層数によらず同じ変数集合を選ぶ
+    picks = []
+    for d in (1, 2, 3):
+        m = DeepCNN((1, 8, 8), 2, depth=d, channels=2, hidden=4, kernel=3)
+        picks.append(tuple(_params_for(m, "conv", 20) or ()))
+    out.append(GuardResult(
+        "cnn: params='conv' は層数を変えても同じ変数を選ぶ",
+        len(set(picks)) == 1, f"{picks[0]} (depth 1,2,3 で一致)"))
+
+    # (2) 記号フォワードが torch と一致する
+    ds = synthetic_classification(n=16, shape=(1, 4, 4), n_classes=2, seed=0)
+    for d in (1, 2):
+        torch.manual_seed(0)
+        m = DeepCNN(ds.shape, 2, depth=d, channels=1, hidden=2, kernel=3)
+        X = ds.X[:3]
+        with torch.no_grad():
+            ref = m(X)
+        names = _params_for(m, "conv", 10)
+        data = fiber_ideal_from_torch(
+            m, X.reshape(3, -1), params=names, input_shape=ds.shape,
+            max_denominator=10 ** 6, zero_tol=1e-12, max_vars=20,
+            loss="classification")
+        polys = [sp.Poly(g, *data["variables"]) for g in data["generators"]]
+        bad = [P for P in polys if P.coeff_monomial(1) != 0]
+        out.append(GuardResult(
+            f"cnn: depth={d} の生成元が theta* で消える", not bad,
+            f"消えない生成元 {len(bad)}/{len(polys)} 個"))
+        # 記号フォワードの数値列を torch と突き合わせる
+        from torch_rlct import _default_handlers, _flatten_layers, _Sym
+        S = _Sym(_flatten_layers(m), [], 1e-12, 10 ** 6, 1,
+                 _default_handlers(10 ** 6))
+        nm = {id(p): n for n, p in m.named_parameters()}
+        dev = 0.0
+        for i in range(3):
+            _, num = S.forward([float(v) for v in X[i].reshape(-1)], nm, {},
+                               shape=ds.shape)
+            for c, v in enumerate(num):
+                dev = max(dev, abs(v - float(ref[i, c])))
+        out.append(GuardResult(
+            f"cnn: depth={d} の記号フォワードが torch と一致",
+            dev < 1e-5, f"最大差 {dev:.2e}"))
+
+    # (5) 境界ユニットが多くてもセル列挙でメモリを食い潰さないこと。
+    # list(product((1,-1), repeat=n))[:max_cells] と書くと n=30 で 2^30 個の
+    # タプルを並べようとして MemoryError になる (深い ReLU CNN で実際に落ちた)。
+    # 前活性化が全部ちょうど 0 の層を作って、その経路を直接踏む。
+    wide = nn.Sequential(nn.Linear(2, 40), nn.ReLU(), nn.Linear(40, 1))
+    with torch.no_grad():
+        wide[0].weight.zero_()          # 40 ユニットすべて前活性化 0 = 境界
+        wide[0].bias.zero_()
+        wide[2].weight.fill_(0.5)
+        wide[2].bias.zero_()
+    ok_mem, note = True, ""
+    try:
+        r = torch_local_rlct(wide, torch.randn(3, 2), params=["2.bias"],
+                             max_vars=8, max_denominator=16, zero_tol=1e-12,
+                             max_cells=4, max_depth=4)
+        warn = [n for n in r.local.notes if "セル" in n and "warn" in n]
+        note = (f"境界 40 本 -> セル 4 個で打ち切り, "
+                f"警告 {'あり' if warn else 'なし'}")
+        ok_mem = bool(warn)             # 打ち切ったなら必ず警告が出ること
+    except MemoryError:
+        ok_mem, note = False, "MemoryError (2^40 セルを materialize した)"
+    out.append(GuardResult(
+        "cnn: 境界ユニットが多くてもセル列挙が爆発せず、打ち切りを報告する",
+        ok_mem, note))
+
+    # (4) 分類 <= 回帰
+    torch.manual_seed(0)
+    m = DeepCNN(ds.shape, 2, depth=1, channels=1, hidden=2, kernel=3)
+    X = ds.X[:6].reshape(6, -1)
+    names = _params_for(m, "conv", 10)
+    lam = {}
+    for loss in ("classification", "regression"):
+        r = torch_local_rlct(m, X, loss=loss, params=names,
+                             input_shape=ds.shape, max_vars=20,
+                             max_denominator=16, zero_tol=1e-2, max_depth=5)
+        lam[loss] = r.local.rlct
+    out.append(GuardResult(
+        "cnn: 分類 lambda <= 回帰 lambda",
+        lam["classification"] <= lam["regression"],
+        f"分類 {lam['classification']} / 回帰 {lam['regression']}"))
+    return out
+
+
 def run_all(verbose: bool = True):
     res = (negative_tests() + mutation_tests() + independent_tests()
            + aoyagi_lemma_tests() + vandermonde_truth_tests()
            + coordinate_invariance_tests() + newton_fastpath_tests()
            + lemma_shortcut_tests() + regular_elimination_tests()
-           + cache_tests())
+           + cache_tests() + relu_case_tests()
+           + transformer_tests() + transformer_torch_tests()
+           + torch_classifier_tests() + vit_tests()
+           + taylor_sweep_tests() + analytic_activation_tests()
+           + cnn_depth_tests())
     if verbose:
         for r in res:
             print("  " + str(r))

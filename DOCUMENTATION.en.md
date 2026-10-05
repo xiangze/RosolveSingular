@@ -509,6 +509,325 @@ Measured (tanh 1-2-1, 7 variables, 6 generators): **19.7s → 1.50s (13×)**, an
 the core generators shrink from 139/137/136 terms of degree 10 to 49/47/46 of
 degree 7, which speeds up the resolution that follows (6.8s → 2.9s end to end).
 
+### 4.6.4 `train_rlct.py` — train on a classification set, then measure λ
+
+Trains an MLP / CNN / ViT on a classification dataset and computes the local
+RLCT at the trained θ\*.
+
+```sh
+python train_rlct.py --model mlp --size 4 --epochs 300 --rlct
+python train_rlct.py --model cnn --size 4 --epochs 300 --rlct --params 0.weight,0.bias
+python train_rlct.py --model vit --size 4 --patch 2 --d-model 2 --epochs 400 \
+                     --rlct --taylor-order 0
+```
+
+> The reference file `xiangze/vision_transformer_demo/vision_demo.py` could not
+> be fetched from this session (the URL needed an authorization that never
+> arrived), so a standard ViT structure is assumed: patch embedding, cls token,
+> positional embedding, encoder layers, classification head.
+
+**The classification fiber ideal is not the regression one.** For
+`p(y|x,θ) = softmax(f(x;θ))`, `p` matches θ\* exactly when the **logit
+differences** match; an overall logit shift `f → f + c(x)` leaves `p` alone. So
+with a reference class `C`,
+
+    g_{i,c} = (f_c − f_C)(θ) − (f_c − f_C)(θ*),   c ≠ C
+
+are the generators (`loss="classification"`), and the shift direction (the
+`(1,…,1)` direction of the output bias) is passed as a symmetry. Using the
+squared-error ideal for a classifier constrains directions that are not
+identifiable and **overestimates** λ — measured λ=6 vs λ=4 on the same 12
+parameters.
+
+The symbolic forward pass gained `Conv2d`, `MaxPool2d`, `AvgPool2d` and
+`AdaptiveAvgPool2d(1)` (pass `input_shape=(C,H,W)` to track shapes). `Conv2d` is
+linear; `MaxPool2d` **freezes the argmax at θ\***, the same move as freezing the
+ReLU cell, so ties give a lower bound. `bench/guards.py::torch_classifier_tests`
+checks the symbolic forward against torch (max deviation 2.4e-6 / 9.1e-6).
+
+**What a trained model's λ means.** A real ViT has 10⁵–10⁶ parameters; exact
+symbolic work is impossible. What is possible is to vary a **subset** and freeze
+the rest at their trained values. Restricting to a subspace shrinks the domain,
+so
+
+    λ(restricted) ≤ λ(full)
+
+and the number reported is a **lower bound** on the full λ (`K = x²+y²` has λ=1,
+but λ=1/2 restricted to `y=0`). Reports always state this direction.
+`rlct_of_trained(kind="vit", vit_layer=ℓ)` takes trained encoder layer ℓ and
+freezes its input token sequence at the trained activations — the λ of a
+different local model, not of the whole ViT.
+
+Measured (synthetic 4×4, 3 classes, `size=4 patch=2 d_model=2 heads=1 d_ff=2`,
+`taylor_order=0`, trained to acc 1.0): `λ = 5 = 9/2 (9 regular directions) +
+1/2 (core)`, 36 variables → 18 free → 6 gauge → 9 regular → core 3.
+
+Data points are sampled **stratified across classes**. Taking the first few
+rows tends to give one class only, every hidden unit inactive, and an
+information-free subproblem (residual identically 0, λ=0): on CNN conv weights,
+the first 4 points gave λ=0 and 6 stratified points gave λ=2.
+
+Downloads are blocked in this container, so the default dataset is synthetic
+(per-class template images plus Gaussian noise); `--dataset mnist|cifar10
+--download` works where torchvision can reach the network.
+
+### 4.6.5 `transformer_rlct.py` — one Transformer layer
+
+Builds the fiber ideal of a typical layer (self-attention + residual +
+MLP(ReLU) + residual) in the form `local_rlct_from_ideal` expects.
+
+    Q^h = X W_Q^h + b_Q^h,  K^h = X W_K^h + b_K^h,  V^h = X W_V^h + b_V^h
+    S^h_{ij} = scale * (Q^h_i · K^h_j),   A^h = softmax_j(S^h)
+    attn_i = concat_h ( Σ_j A^h_{ij} V^h_j )
+    Y_i = X_i + attn_i W_O + b_O                 (residual 1)
+    Z_i = Y_i + ReLU(Y_i W_1 + b_1) W_2 + b_2    (residual 2)
+
+**Making softmax polynomial.** softmax is not a polynomial, but its
+**denominator is a unit near θ\***, so it can be cleared. The RLCT is an
+invariant of the ideal and does not change under multiplication by a unit, so
+this is not an approximation — the only approximation is truncating the
+exponential:
+
+    δ_{ij} = S_{ij}(θ) − S*_{ij}
+    E_{ij} = e*_{ij} · Σ_{k≤n} δ_{ij}^k / k!      (polynomial)
+    D_i    = Σ_j E_{ij}                            (> 0 at θ*, so a unit)
+    A_{ij} = E_{ij} / D_i
+
+`e*_{ij}` is `exp(S*_{ij})` rounded to a rational, and **the same rounded value
+is used in the symbolic and the numeric path**, so the generators vanish exactly
+at θ\* rather than leaving the rounding as a residual. The output residual
+contains `1/D_i` to first order only, so multiplying by `D_i` clears it.
+
+LayerNorm is **not** included by default (the `1/sqrt` is not polynomial and it
+adds scale symmetries). A torch layer with LayerNorm raises unless
+`layernorm="ignore"` is passed explicitly — silently computing a different model
+is worse than failing.
+
+| Symmetry | Content | Dimension |
+|---|---|---|
+| QK gauge | `W_Q → W_Q M, W_K → W_K M^{-T}` leaves `Q·K` fixed | `d_k²` per head |
+| VO gauge | `W_V → W_V N, W_O → N^{-1} W_O` leaves `attn·W_O` fixed | `d_k²` per head |
+| softmax shift | `b_K → b_K + c` shifts logits by a j-independent amount | `d_k` per head |
+| ReLU homogeneity | `(W_1[:,m], b_1[m]) → t(·), W_2[m,:] → /t` | 1 per FFN unit |
+
+For `d = d_k = d_ff = 2, H = 1` that is 4+4+2+2 = 12 directions.
+`bench/guards.py::transformer_tests` checks by directional derivative that each
+claimed symmetry **really is** one.
+
+**Cost — the bottleneck is term count, not coefficient size** (`d_model=2, T=2`):
+
+| `taylor_order` | dk=1 ff=1 | dk=1 ff=2 | dk=2 ff=2 |
+|---|---|---|---|
+| 0 (attention frozen at θ\*) | 0.1s (9 terms) | 1.2s (66) | 2.7s (207) |
+| 1 | 3.8s (101 terms) | 119s (524) | > 10 min |
+
+Lowering the `exp` denominator bound from 10⁴ to 16 changes neither the term
+count nor the time (93.5s → 93.5s). `taylor_order=0` freezes the attention
+pattern at θ\* (`A = A*`), so `W_Q, W_K, b_Q, b_K` leave the generators and
+become free directions — the λ of a **different model** (value/output circuit
+plus FFN), but orders of magnitude cheaper. Multi-head (`H ≥ 2`) multiplies the
+row denominators across heads, doubling the degree: `H=2, order=1` reached 14528
+terms against 101 for `H=1`, so use `taylor_order=0` for multiple heads.
+
+### 4.6.6 `taylor_sweep.py` — λ as a function of the softmax truncation order
+
+Lists λ for the model obtained by truncating softmax at order n = 0, 1, 2, 3, …
+around a solution θ\* of one Transformer layer.
+
+```bash
+python taylor_sweep.py --loss regression --orders 0,1,2,3 --timeout 900
+python taylor_sweep.py --loss classification --classes 2 --seqs 2 --orders 0,1,2
+python taylor_sweep.py --degeneracy uniform_att --orders 0,1,2
+python taylor_sweep.py --source trained --loss classification --orders 0,1
+```
+
+`--timeout` defaults to 120s; order 3 takes 414s even at the smallest shape, so
+pass `--timeout 900` to reach it.
+
+Changing n **changes the model**, so λ may change with it. "What is λ" is
+therefore an incomplete question; the meaningful one is
+
+> does λ stop as n grows, and if so where?
+
+softmax is analytic, so beyond the order that captures the local singularity λ
+must stop moving, and **where it stops is a measure of how deep the singularity
+at θ\* is**. `summarize()` decides only that, and when λ is still moving it says
+so and refuses to let the value be used as settled. `n = 0` freezes attention at
+θ\* and is listed as a baseline, not as part of the n ≥ 1 series.
+
+The fiber ideal makes **θ\* itself the true parameter** (realizable; θ\* is a
+global minimum with loss 0). `loss="regression"` matches the layer outputs;
+`loss="classification"` puts a linear head on the cls token and matches **logit
+differences**, passing the logit shift as a symmetry. Each order is solved in a
+**separate process**, so one hang does not stop the sweep, and the timeout is
+recorded. Several input sequences are built by calling
+`transformer_layer_ideal` with the **same `prefix`** so they share symbols.
+`--source trained` trains a `train_rlct.TinyViT` and uses its encoder layer 0,
+its head, and the trained layer-0 input as θ\* and X. Only `pool="cls"`.
+
+Measured (d_model=2, d_k=1, d_ff=1, T=2, max_denominator=8):
+
+| setting | n=0 | n=1 | n=2 | n=3 | verdict |
+|---|---|---|---|---|---|
+| regression / none / seq1 | 2 | 2 (1.8s) | 2 (34s) | **2 (414s)** | all orders agree |
+| classification / none / C2 seq2 | 1 | 1 (6.2s) | 1 (100s) | — | all orders agree |
+| classification / **trained TinyViT** / C2 | 1/2 | 1/2 (97s) | timeout(300s) | — | undecided (one order ≥ 1) |
+| regression / **uniform_att** | 1 | **3/2** (18s) | timeout | timeout | **undecided** |
+| regression / none / seq2 | 7/2 | timeout(150s) | timeout | — | undecided |
+| regression / dead_ffn / ff2 | 2 | timeout(150s) | timeout | — | undecided |
+| regression / zero_ffn / ff2 | 2 | timeout(120s) | timeout | — | undecided |
+
+The largest generator grows 9 → 87 → 420 → 1400 terms (regression) and
+46 → 552 → 2760 (classification), and the resolution time tracks that growth
+(0.1s → 1.8s → 34s → 414s). The honest conclusion: at a **non-degenerate** θ\*
+orders 1, 2 and 3 agree, so the truncation is not changing the local structure
+(λ = 2 for regression, λ = 1 for classification at this shape). Trained TinyViT
+layer 0 gives λ = 1/2 at both n = 0 and n = 1, but n = 0 is the frozen-attention
+baseline, so by `summarize()`'s own rule only one order ≥ 1 was solved and the
+value is **not** settled. At a **degenerate** θ\* (`uniform_att`,
+`dead_ffn`, `zero_ffn`) λ already changes between n=0 and n=1 (1 → 3/2) and
+n ≥ 2 is out of reach, so **λ there is not determined**. The more degenerate the
+point, the more the truncation matters — the case one most wants is the one that
+demands the highest order. That is the present complexity wall.
+
+### 4.6.7 `cnn_sweep.py` — λ of a several-layer CNN by depth, activation and order
+
+Builds `DeepCNN` as
+
+```
+[Conv2d -> act -> (MaxPool2d)] x depth -> Flatten -> Linear -> act -> Linear
+```
+
+**trains it** (cross-entropy for classification, squared error for regression)
+and computes the local RLCT at the trained θ\*. Four axes:
+
+| axis | values | note |
+|---|---|---|
+| `depth` | 1, 2, 3, … | number of conv layers |
+| `act` | relu / tanh | **different models**; comparing their λ directly is meaningless |
+| `taylor_order` | 1, 2, 3, … | order of the tanh expansion at θ\*. **Irrelevant for ReLU** |
+| `loss` | classification / regression | classification matches logit differences (`4.6.4`) |
+
+```bash
+python cnn_sweep.py --depths 1,2,3 --acts relu,tanh --orders 1,2,3 --losses both \
+    --size 8 --channels 2 --kernel 2 --hidden 2 --n-data 8 --params conv --max-vars 10
+```
+
+**To compare depths, the same variables must be varied.** `--params conv` takes
+whole convolution layers from the input side, as many as fit in `--max-vars`.
+With `kernel=2, channels=2` the first convolution is `1·2·2·2 + 2 = 10`
+parameters, so **the same 10 variables are varied at every depth** — the
+comparison is "vary the same parameters, stack more layers on top".
+`bench/guards.py::cnn_depth_tests` checks that the selected variable set is
+identical for depths 1, 2, 3; if that breaks, the comparison silently becomes one
+between different subspaces. `--params head` takes a **contiguous** tail from the
+output side (skipping to pick up a later layer would give an incoherent
+cross-layer subspace). `--params all` varies everything but only works on tiny
+shapes. All of them are subspace restrictions, so the λ reported is a **lower
+bound** on the full λ (`4.6.4`).
+
+**Generator count vs free directions.** The number of generators is fixed by the
+data (`n_data × (C−1)` for classification, `n_data × n_out` for regression). With
+fewer generators than parameters the rest become free directions and λ is decided
+by data scarcity, not by depth. The report prints `gens`, `free` and `dead` and
+says explicitly when `gens < (variables − free)`, or when free directions exceed
+60% of the variables — which is either (a) too little data or (b) a hidden-layer
+bottleneck / dead units. In this shape the hidden layer has 2 units, so only 4–5
+of the 10 conv variables reach λ at all, for reason (b).
+
+#### Two bugs this found
+
+**(1) Analytic-activation coefficients were falling into an extension field.**
+Building the tanh Taylor coefficients with `sp.nsimplify` leaves **transcendental
+constants** like `tanh(1180339/2500000)` in the coefficients. sympy then carries
+the polynomials in the `EX` domain and everything downstream slows by orders of
+magnitude — the CNN case did not finish in 10 minutes. Rounding the coefficients
+to rationals brings it to **0.2s**. The values were correct, so this was "only"
+a performance bug, but it made this class of problem effectively uncomputable.
+
+**(2) Rounding at absolute precision made λ a false 0.** Doing that rounding
+naively with `limit_denominator(max_denominator)` sends the first-order tanh
+coefficient `1 − tanh(z₀)² ~ e^{−2|z₀|}` **to 0** whenever the pre-activation is
+large and `max_denominator` is small (16). The activation becomes a constant, so
+**every upstream parameter looks like a free direction and λ comes out 0** —
+observed as λ=0 with 10/10 free directions on the CNN. `_rat_rel` now keeps
+**relative** precision (for `|v| < 1` it raises the denominator bound by `1/|v|`).
+The bound is capped at `max_denominator × 10⁹`, and any coefficient still floored
+to zero (a saturated unit) is recorded in `meta["rounding_notes"]` — λ changes
+discontinuously there, so it must not be dropped silently.
+
+`analytic_activation_tests()` holds both as regression tests (reinstating the old
+implementation turns 3 of them red).
+
+**(3) Cell enumeration exploded in the number of boundary units.** With `n` units
+whose pre-activation is 0, `list(itertools.product((1,−1), repeat=n))[:max_cells]`
+**materializes 2ⁿ tuples before truncating**. A deep ReLU CNN reaches a few dozen
+boundary units and died with MemoryError. It now truncates with
+`itertools.islice` first. When cells *are* truncated, a warning note now says
+that λ is the **min over a subset** and may exceed the min over all cells —
+truncation breaks the lower-bound direction, so it cannot stay silent.
+
+#### θ\* has to be a good solution
+
+A deep ReLU net can start with every unit dead and never train; the λ at such a
+point says nothing about depth. `--seeds 0,1,2,3` retries seeds until `fit`
+(accuracy for classification, R² for regression) reaches `--fit-min`, and the
+report always says which seed was used or that none sufficed. ReLU depth 3
+classification does not train at seed 0 and reaches acc 1.00 at seed 1.
+
+#### Measured
+
+Shape: 1×8×8 images, conv ch=2, kernel=2, hidden=4, 2 classes (1-d output for
+regression). The varied variables are **the 10 of the first convolution** (the
+same set at every depth). 8 data points → 8 generators.
+`--seeds 0,1,2,3 --fit-min 0.95`.
+
+**Classification (cross-entropy)**
+
+| depth | relu | tanh n=1 | tanh n=2 | tanh n=3 |
+|---|---|---|---|---|
+| 1 | 4 (121s) | 4 (31s) | timeout(600s; 900s at 4 points) | timeout(600s) |
+| 2 | **2** (203s) | 4 (97s) | — | — |
+| 3 | 4 (225s, seed 1) | timeout(400s) | — | — |
+
+**Regression (squared error)**
+
+| depth | relu | tanh n=1 |
+|---|---|---|
+| 1 | 4 (115s) | 4 (36s) |
+| 2 | 4 (116s) | timeout(400s) |
+| 3 | 7/2 (249s, fit=0.93) | timeout(400s) |
+
+Almost every case is "regular directions only, empty core", so λ = (number of
+regular directions)/2. Of the 10 variables, 7–8 reach λ (only 4 for
+classification at depth 2).
+
+#### What it shows
+
+- **With ReLU, λ does not move monotonically with depth** — 4 → 2 → 4 for
+  classification. Since λ = regular/2, this says how many of the first
+  convolution's 10 parameters are identifiable from the output is not monotone in
+  depth: adding ReLU layers adds dead units and cell boundaries, which can
+  *reduce* the identifiable directions.
+- **With tanh, λ = 4 at every depth that finished** (1 and 2). tanh creates no
+  dead units, so identifiability is insensitive to depth here.
+- **λ(regression) ≥ λ(classification)**, as it must be — classification only
+  constrains logit differences. The gap shows at depth 2 (4 vs 2), a measured
+  instance of why using the regression ideal for a classifier overestimates λ
+  (`4.6.4`).
+- **The tanh order only reaches 1.** Order ≥ 2 does not finish in 600s, nor in
+  900s with the data cut to 4 points, so
+  whether λ stops as the order grows is **not established** for CNNs, and
+  `summarize()` says so. The softmax sweep (`4.6.6`) reached order 3 on a
+  Transformer; the CNN tanh case does not because relative-precision rounding
+  stretches coefficient denominators to ~10¹³.
+- Regression at depth 3 never reached `--fit-min 0.95` (fit=0.93 over all 4
+  seeds), so **that 7/2 is not a value at a good solution** and cannot be used for
+  the depth comparison.
+
+Every value is a subspace restriction (first convolution only), hence a **lower
+bound** on the full λ.
+
 ### 4.7 `torch_rlct.py` — importing PyTorch models
 
 ```python
@@ -777,7 +1096,7 @@ them*. To keep the two apart:
 | structured, 51 cases (n ≤ 6, d ≤ 13) | 51/51 |
 | random, 111 cases (n ≤ 3, d ≤ 6) | 111/111 |
 | random, 36 cases (n = 4–5, d = 4–8) | 22/36 (all failures are `resolve_max_depth`) |
-| guards, 17 checks | 17/17 green |
+| guards, 169 checks | 169/169 green (1 known unfixed bug reported outside the gate) |
 | disagreements with independent values | 0 |
 
 At n = 4,5 **every** failure is on the resolution side; none are on the proof
@@ -804,6 +1123,10 @@ added.
 | charts that were resolved *and* recentred were discarded | λ could be overestimated | add them to `done` |
 | used a real isolatedness test for the μ formula | `(x²+y²)²` gave μ=9 (true ∞) | use complex zero-dimensionality |
 | CBC precision | pruned every chart, λ=∞ | 1e-6 relative slack on the upper bound |
+| tanh coefficients built with `nsimplify` | transcendental constants dropped the polynomials into the `EX` domain — uncomputable (>10 min) | round the coefficients to rationals (0.2s) |
+| that rounding done at absolute precision | the first-order coefficient of a saturated tanh rounded to 0, so **every upstream parameter looked free and λ came out 0** | `_rat_rel` keeps relative precision |
+| cells enumerated as `list(product(...))[:max_cells]` | MemoryError at a few dozen boundary units | truncate with `islice` before materializing |
+| truncated cell enumeration stayed silent | λ is the min over a *subset* yet was treated as a lower bound | emit a warning note |
 
 The hard part of this problem is that **a wrong answer does not look wrong**.
 The four defences that actually worked: comparison against known closed forms,
@@ -851,6 +1174,22 @@ guard.
   and signal-based timeouts are delayed inside C-level calls
 - **No independent check of covering completeness**: the "drop one chart"
   mutation is undetectable when the dropped chart was not the minimizer
+- **The tanh truncation order only reaches 1 either**: in `cnn_sweep.py`,
+  expanding tanh to order ≥ 2 on a several-layer CNN does not finish in 600s.
+  The main cause is that relative-precision rounding pushes coefficient
+  denominators to ~10¹³, which compounds with the order. Checking "does λ stop as
+  the order grows" is currently out of reach for CNNs
+- **With many boundary units not all cells can be examined**: enumeration stops
+  at `max_cells` (default 32), so λ is the **min over a subset** of cells and may
+  exceed the true min over all of them — which is the wrong direction for a lower
+  bound. A truncated enumeration emits a warning note
+- **The softmax truncation order cannot be raised far enough**: in
+  `taylor_sweep.py` only the smallest non-degenerate shape (d_k = d_ff = 1, one
+  sequence) reaches order 3 (1400 generator terms, 414s); a degenerate θ\* or two
+  sequences already stalls at order 1. **The more degenerate the point, the
+  higher the order needed and the less solvable it is**, so the λ one actually
+  wants stays undetermined (`4.6.6`). The bottleneck is the generator term
+  count, not coefficient size
 
 ---
 

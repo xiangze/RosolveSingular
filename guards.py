@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import math
+import sys
 from dataclasses import dataclass
 from typing import List
 
@@ -308,30 +309,330 @@ def known_issues() -> List[GuardResult]:
 
     修正されたら OK になるので、その時点で通常のガードに昇格させる。
 
-    (1) Vandermonde 型の chart 内で座標依存が起きる。
-        原因: 解消器は多項式 sum g_i^2 を運んでおり、イデアル <g_i> の
-        生成元を座標に取る操作ができない (Aoyagi Lemma 1(2) より lambda は
-        イデアルだけで決まるのに、多項式に潰した時点でその自由度を失う)。
+    (1) **多項式を運ぶ経路は Vandermonde 族で λ を過大評価する。**
+        chart 内の座標依存 (3/2 対 7/6) は `ideal_resolve` に h0 を渡す
+        ことで解決した (`ideal_coordinate_invariance_tests` に昇格)。
+        しかし族全体では、イデアル経路が H >= 3 で**停止しない**ため、
+        値は多項式経路の過大評価が残る。実測:
+
+            M=N=1,Q=1  H=2: 真値 3/4  多項式 1    イデアル 3/4 (一致)
+                       H=3: 真値 1    多項式 3/2  イデアル 停止せず
+                       H=4: 真値 7/6  多項式 2    イデアル 停止せず
+            M=N=1,H=3,Q=2:  真値 5/6  多項式 3/2  イデアル 停止せず
+
+        停止しない原因は中心の選び方で、`a1_1` の chart で 11 回続けて
+        ブローアップしても不変量が落ちない。正しい一般化は Aoyagi の
+        rational blowing-up (Entropy 21(6):561, 2019) かトーリック解消。
+
+        **重要**: これらは `certify` が status='refuted' を返すので、
+        誤った値が proved として出ることはない。その検査は
+        `vandermonde_never_proved_wrong_tests` にある。
     """
     from resolve_singularity import resolve_singularities
+    out: List[GuardResult] = []
+    sys.path[:0] = ["."]
+    try:
+        from vandermonde import lambda_N1, vandermonde_ideal
+    except Exception:                                    # noqa: BLE001
+        return out
+    for (M, N, H, Q) in ((1, 1, 3, 1), (1, 1, 3, 2)):
+        gens, V = vandermonde_ideal(M, N, H, Q)
+        truth = lambda_N1(M, H, Q)[0]
+        f = sp.expand(sum(g ** 2 for g in gens))
+        try:
+            got = resolve_singularities(f, V, prune="ties", weighted=True,
+                                        max_depth=14).rlct
+            out.append(GuardResult(
+                f"[既知] Vandermonde M={M} H={H} Q={Q} の多項式経路",
+                got == truth,
+                f"多項式経路 {got} / 真値 {truth}"
+                + ("" if got == truth
+                   else "  <- 未修正 (イデアル経路が停止しない)")))
+        except Exception as e:                           # noqa: BLE001
+            out.append(GuardResult(
+                f"[既知] Vandermonde M={M} H={H} Q={Q} の多項式経路", False,
+                f"評価できません: {str(e)[:40]}"))
+    return out
+
+
+def resnet_tests() -> List[GuardResult]:
+    r"""**ResNet 経路の検査** (`resnet_rlct.py`)。
+
+    (1) **BatchNorm の畳み込みが厳密か。** BN は 1/sqrt を含むので多項式で
+        ないが、評価モードでは統計量が定数なのでアフィン写像であり、直前の
+        畳み込みに厳密に畳み込める。ここで出力の一致を確かめないと、以降の
+        λ は「別のモデル」の値になる。
+    (2) **記号の「ずれ」が torch の実際の出力変化と一致するか。**
+        生成元が θ\* で 0 になるのは必要条件にすぎない。パラメータを δ
+        動かしたときの変化を突き合わせるのが本当の検査。
+        BasicBlock (resnet18) と Bottleneck (resnet50)、残差と downsample、
+        layer4 の中の conv をそれぞれ踏む。
+        **float64 で比べること**: float32 だと丸めが 1e-7 で、相対誤差が
+        その雑音に埋もれて 1e-3 まで悪化して見える (実測)。
+    (3) **閉形式との一致**: `fc.bias` だけを動かした分類は、ロジットの
+        平行移動が対称性なので「C 個のバイアス − 1 本の対称性」が拘束され
+        **λ = (C−1)/2**。resnet18 で C=10 なら 9/2。
+    (4) 死んだ入力チャネルから読む重みは出力に効かない = 自由方向。
+    (5) BN が残っていたら例外を上げる (黙って別のモデルを計算しない)。
+    """
+    import torch
+    try:
+        import torchvision.models as tvm
+    except Exception:                                     # noqa: BLE001
+        return [GuardResult("resnet: torchvision が無いので省略", True, "")]
+
+    import sympy as _sp
+
+    from resnet_rlct import (SymEval, SymTensor, _resnet_modules,
+                            fuse_check, fuse_conv_bn, resnet_local_rlct)
+
+    out: List[GuardResult] = []
+    X32 = torch.randn(3, 3, 32, 32,
+                      generator=torch.Generator().manual_seed(0))
+
+    # (1) BN 融合
+    for arch in ("resnet18", "resnet50"):
+        m = getattr(tvm, arch)(weights=None, num_classes=10).eval()
+        ok, dev = fuse_check(m, X32)
+        out.append(GuardResult(f"resnet: {arch} の BN 融合が厳密", ok,
+                               f"出力の最大差 {dev:.2e}"))
+
+    # (2) 記号のずれ 対 torch の実変化
+    def dev_check(arch, pname, tail_from, idxs, delta=1e-2, nc=10):
+        m = getattr(tvm, arch)(weights=None, num_classes=nc).eval()
+        fz = fuse_conv_bn(m).double()
+        X = torch.randn(2, 3, 32, 32,
+                        generator=torch.Generator().manual_seed(0)).double()
+        mods = _resnet_modules(fz)
+        cut = [a for a, _ in mods].index(tail_from)
+        pd = dict(fz.named_parameters())
+        syms = {i: _sp.Symbol(f"u_{pname.replace('.', '_')}_{i}", real=True)
+                for i in idxs}
+        name_of = {id(q): nm for nm, q in fz.named_parameters()}
+        with torch.no_grad():
+            h = X
+            for nm, mod in mods[:cut]:
+                h = mod(h)
+            base = fz(X).clone()
+        ev = SymEval({pname: syms}, name_of, max_den=10 ** 12)
+        outs = []
+        for i in range(X.shape[0]):
+            t = SymTensor(num=h[i].detach().numpy().astype("float64").reshape(-1),
+                          sym={}, shape=tuple(h[i].shape))
+            for nm, mod in mods[cut:]:
+                t = ev.module(mod, t, nm)
+            outs.append(t)
+        g = torch.Generator().manual_seed(7)
+        pert = {s: float(delta * (2 * torch.rand(1, generator=g).item() - 1))
+                for s in syms.values()}
+        with torch.no_grad():
+            fl = pd[pname].reshape(-1)
+            for i, s in syms.items():
+                fl[i] += pert[s]
+            after = fz(X).clone()
+            for i, s in syms.items():
+                fl[i] -= pert[s]
+        sub = {s: _sp.Rational(v).limit_denominator(10 ** 16)
+               for s, v in pert.items()}
+        worst = scale = 0.0
+        for i in range(X.shape[0]):
+            for c in range(outs[i].size):
+                d = outs[i].sym.get(c)
+                pred = float(_sp.expand(d).subs(sub)) if d is not None else 0.0
+                real = float(after[i, c] - base[i, c])
+                worst = max(worst, abs(pred - real))
+                scale = max(scale, abs(real))
+        return (worst / scale if scale > 0 else None), ev.n_sym_max
+
+    for arch, pname, tail, idxs in (
+            ("resnet18", "fc.bias", "layer4", range(10)),
+            ("resnet18", "fc.weight", "avgpool", range(24)),
+            ("resnet50", "fc.bias", "layer4", range(10)),
+            ("resnet50", "layer4.2.conv3.weight", "layer4", range(6))):
+        try:
+            rel, nmax = dev_check(arch, pname, tail, list(idxs))
+            ok = rel is not None and rel < 1e-9
+            out.append(GuardResult(
+                f"resnet: {arch} {pname} の記号のずれが torch と一致", ok,
+                (f"相対 {rel:.2e} (記号最大 {nmax})" if rel is not None
+                 else "変化が 0 で検査できず")))
+        except Exception as e:                            # noqa: BLE001
+            out.append(GuardResult(
+                f"resnet: {arch} {pname} の記号のずれが torch と一致", False,
+                f"{type(e).__name__}: {str(e)[:70]}"))
+
+    # (3) 閉形式: fc.bias だけなら λ = (C−1)/2
+    for nc in (10, 5):
+        try:
+            m = tvm.resnet18(weights=None, num_classes=nc).eval()
+            X = torch.randn(8, 3, 32, 32,
+                            generator=torch.Generator().manual_seed(0))
+            rep = resnet_local_rlct(m, X, params=["fc.bias"],
+                                    tail_from="layer4",
+                                    loss="classification", max_vars=40,
+                                    max_depth=8)
+            want = sp.Rational(nc - 1, 2)
+            out.append(GuardResult(
+                f"resnet: fc.bias のみ (C={nc}) で λ=(C-1)/2",
+                rep.local.rlct == want,
+                f"λ={rep.local.rlct} 期待 {want} "
+                f"(ゲージ {len(rep.local.gauge_fixed)} 本, "
+                f"正則 {len(rep.local.regular_vars)} 本)"))
+        except Exception as e:                            # noqa: BLE001
+            out.append(GuardResult(
+                f"resnet: fc.bias のみ (C={nc}) で λ=(C-1)/2", False,
+                f"{type(e).__name__}: {str(e)[:70]}"))
+
+    # (5) BN が残っていたら例外
+    try:
+        m = tvm.resnet18(weights=None, num_classes=10).eval()
+        mods = _resnet_modules(m)          # 融合していない
+        ev = SymEval({}, {}, max_den=10 ** 6)
+        t = SymTensor(num=torch.zeros(3 * 32 * 32).numpy(), sym={},
+                      shape=(3, 32, 32))
+        raised = False
+        try:
+            for nm, mod in mods:
+                t = ev.module(mod, t, nm)
+        except RuntimeError as e:
+            raised = "BatchNorm" in str(e)
+        except Exception:                                 # noqa: BLE001
+            raised = False
+        out.append(GuardResult("resnet: BN が残っていたら例外を上げる",
+                               raised, "fuse_conv_bn を促す"))
+    except Exception as e:                                # noqa: BLE001
+        out.append(GuardResult("resnet: BN が残っていたら例外を上げる", False,
+                               str(e)[:60]))
+    return out
+
+
+def dln_formula_tests() -> List[GuardResult]:
+    r"""**Aoyagi の深層線形網の閉形式**の実装と、それとの一致。
+
+    M. Aoyagi, Neural Networks 172:106132 (2024) Theorem 1。
+    LLC の数値推定が校正に使っている唯一の族なので、ここでの一致が一番効く。
+
+    (1) 公式の実装を同論文 Theorem 2 (L=2 の縮約ランク回帰) と総当りで
+        突き合わせる (`dln.self_check`)。PDF からの抽出で M̄ の上線や
+        r² の指数が落ちている可能性があったので、この検算は必須。
+    (2) 我々の厳密計算が公式と一致するか。**値が違うなら status が
+        'proved' でないこと**も併せて検査する。
+    """
+    sys.path[:0] = ["."]
+    out: List[GuardResult] = []
+    try:
+        from dln import dln_cases, lambda_dln, self_check
+    except Exception as e:                               # noqa: BLE001
+        return [GuardResult("dln: 読み込み", False, str(e)[:60])]
+
+    for name, ok, note in self_check(verbose=False):
+        out.append(GuardResult(f"dln: 公式の実装 — {name}", ok, note))
+
+    from certify import rlct_certified
+    agree = dis = unsound = 0
+    detail = []
+    for (nm, f, V, fam, lam0, th0) in dln_cases(max_vars=10):
+        try:
+            lam, status, _ = rlct_certified(f, V, max_depth=10)
+        except Exception:                                 # noqa: BLE001
+            continue
+        if lam is not None and sp.nsimplify(lam) == sp.nsimplify(lam0):
+            agree += 1
+        else:
+            dis += 1
+            if str(status) == "proved":
+                unsound += 1
+                detail.append(f"{nm}: {lam} 対 {lam0} (proved)")
+    out.append(GuardResult(
+        "dln: 厳密計算が公式と一致 (不一致は proved でない)",
+        unsound == 0,
+        f"一致 {agree}, 不一致 {dis} (うち proved {unsound})"
+        + (("  " + "; ".join(detail)) if detail else "")))
+    return out
+
+
+def ideal_coordinate_invariance_tests() -> List[GuardResult]:
+    r"""**イデアルを運ぶ経路が座標不変であること** (旧 known_issues (1))。
+
+    λ はイデアルだけで決まる (Aoyagi, Entropy 2019, Lemma 1(2))。ところが
+    多項式 `Σ g_i²` に潰すと「生成元を座標に取る」操作ができなくなり、
+    Vandermonde の chart 問題
+
+        P = v⁴(G₁² + v²G₂² + v⁴G₃²),  G_k = a₁ + a₂b₂^k + a₃b₃^k
+        (親から h = [5,0,0,0,0,0] を引き継いでいる)
+
+    で、chart 座標のままだと 3/2、`G₁` を座標に取ると 7/6 になっていた。
+
+    `resolve_ideal` に生成元 `[v²G₁, v³G₂, v⁴G₃]` と **h0** を渡すと
+    どちらの座標でも 7/6 になる。h0 を渡さないと h=0 の別問題を解いて
+    1/4 になるので、**h0 の受け渡しもここで検査する**。
+    """
+    from ideal_resolve import resolve_ideal
+
     v, a1, a2, a3, b2, b3, u1 = sp.symbols("v a1 a2 a3 b2 b3 u1", real=True)
     G = [a1 + a2 * b2**k + a3 * b3**k for k in (1, 2, 3)]
-    P = sp.expand(v**4 * (G[0]**2 + v**2 * G[1]**2 + v**4 * G[2]**2))
+    g1 = [sp.expand(v**2 * G[0]), sp.expand(v**3 * G[1]),
+          sp.expand(v**4 * G[2])]
+    sub = {a1: u1 - a2 * b2 - a3 * b3}
+    g2 = [sp.expand(g.subs(sub, simultaneous=True)) for g in g1]
     h0 = [5, 0, 0, 0, 0, 0]
     out: List[GuardResult] = []
     try:
-        l1 = resolve_singularities(P, (v, a1, a2, a3, b2, b3), prune="ties",
-                                   weighted=True, max_depth=14, h0=h0).rlct
-        P2 = sp.expand(P.subs({a1: u1 - a2 * b2 - a3 * b3}, simultaneous=True))
-        l2 = resolve_singularities(P2, (v, u1, a2, a3, b2, b3), prune="ties",
-                                   weighted=True, max_depth=14, h0=h0).rlct
+        r1 = resolve_ideal(g1, (v, a1, a2, a3, b2, b3), max_depth=14, h0=h0)
+        r2 = resolve_ideal(g2, (v, u1, a2, a3, b2, b3), max_depth=14, h0=h0)
         out.append(GuardResult(
-            "[既知] Vandermonde chart の座標不変性", l1 == l2,
-            f"chart 座標 {l1} / G1 を座標に取ると {l2}"
-            + ("" if l1 == l2 else "  <- 未修正 (イデアルを運んでいないため)")))
+            "ideal: Vandermonde chart が座標不変",
+            r1.rlct == r2.rlct,
+            f"chart 座標 {r1.rlct} / G1 を座標に {r2.rlct}"))
+        out.append(GuardResult(
+            "ideal: その値が多項式経路の良い方 (7/6) と一致",
+            r1.rlct == sp.Rational(7, 6), f"{r1.rlct}"))
+        # h0 を渡さないと別の問題を解くことの確認 (受け渡しの回帰テスト)
+        r0 = resolve_ideal(g1, (v, a1, a2, a3, b2, b3), max_depth=14)
+        out.append(GuardResult(
+            "ideal: h0 を渡さないと値が変わる (= h0 が効いている)",
+            r0.rlct != r1.rlct, f"h0 なし {r0.rlct} / h0 あり {r1.rlct}"))
     except Exception as e:                               # noqa: BLE001
-        out.append(GuardResult("[既知] Vandermonde chart の座標不変性", False,
-                               f"評価できません: {str(e)[:40]}"))
+        out.append(GuardResult("ideal: Vandermonde chart が座標不変", False,
+                               f"例外 {type(e).__name__}: {str(e)[:60]}"))
+    return out
+
+
+def vandermonde_never_proved_wrong_tests() -> List[GuardResult]:
+    r"""**真値と違う値を 'proved' として返さないこと。**
+
+    Vandermonde 族は現状 H >= 3 で λ を過大評価する (`known_issues` 参照)。
+    これが「静かに誤った値を返す」のか「誤りだと分かっている」のかは
+    まったく別の話で、後者でなければ厳密計算を名乗れない。
+
+    ここでは族の各ケースについて `rlct_certified` を回し、
+    **値が真値と違うなら status が 'proved' でないこと**を検査する。
+    値が合っているかどうかは問わない (それは `known_issues` の役目)。
+    """
+    from certify import rlct_certified
+
+    sys.path[:0] = ["."]
+    out: List[GuardResult] = []
+    try:
+        from vandermonde import lambda_N1, vandermonde_ideal
+    except Exception:                                    # noqa: BLE001
+        return out
+    for (M, N, H, Q) in ((1, 1, 2, 1), (1, 1, 3, 1), (1, 1, 3, 2)):
+        gens, V = vandermonde_ideal(M, N, H, Q)
+        truth = lambda_N1(M, H, Q)[0]
+        f = sp.expand(sum(g ** 2 for g in gens))
+        try:
+            lam, status, route = rlct_certified(f, V, max_depth=14)
+            ok = (lam == truth) or (status != "proved")
+            out.append(GuardResult(
+                f"vdm: M={M} H={H} Q={Q} は誤った値を proved にしない", ok,
+                f"λ={lam} 真値={truth} status={status}"
+                + ("" if lam == truth else " (値は不一致だが proved でない)"
+                   if ok else "  <- **誤った値を proved にした**")))
+        except Exception as e:                           # noqa: BLE001
+            out.append(GuardResult(
+                f"vdm: M={M} H={H} Q={Q} は誤った値を proved にしない", False,
+                f"例外 {type(e).__name__}: {str(e)[:60]}"))
     return out
 
 
@@ -1252,7 +1553,9 @@ def run_all(verbose: bool = True):
            + transformer_tests() + transformer_torch_tests()
            + torch_classifier_tests() + vit_tests()
            + taylor_sweep_tests() + analytic_activation_tests()
-           + cnn_depth_tests())
+           + cnn_depth_tests() + ideal_coordinate_invariance_tests()
+           + vandermonde_never_proved_wrong_tests()
+           + dln_formula_tests() + resnet_tests())
     if verbose:
         for r in res:
             print("  " + str(r))

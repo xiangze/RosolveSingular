@@ -1247,6 +1247,26 @@ def rlct_interval(f, gens=None, *, timeout_ms: int = 20000,
     except Exception:
         pass
 
+    # --- lc_filter: 健全な上下界 (ブローアップなし) ---------------------
+    gs_lc = generators if generators is not None else _sum_of_squares(f, gens)
+    if gs_lc:
+        try:
+            from lc_filter import lc_bounds
+            lcb = lc_bounds(gs_lc, gens)
+            if lcb.lo > lo:
+                lo = lcb.lo
+                src["lc_filter 下界"] = "; ".join(v for k, v in lcb.sources.items()
+                                                 if k.startswith("L"))
+            if lcb.hi is not None and lcb.hi < hi:
+                hi = lcb.hi
+                src["lc_filter 上界"] = lcb.sources.get("U1 有理点", "")
+            notes.extend(f"lc_filter: {x}" for x in lcb.notes)
+        except Exception as e:                        # noqa: BLE001
+            notes.append(f"lc_filter 失敗 ({str(e)[:60]})")
+        if lo == hi:
+            return RLCTInterval(lo, hi, "exact", lo, src,
+                                notes + ["lc_filter の上下界が一致 (解消は不要)。"])
+
     if ideal:
         gs = generators if generators is not None else _sum_of_squares(f, gens)
         if gs:
@@ -1441,6 +1461,23 @@ def _rlct_certified_inner(f, gens, *, timeout_ms, max_depth, verbose,
 
     gs = generators if generators is not None else _sum_of_squares(f, gens)
 
+    # --- lc_filter: 健全な上下界。一致すればブローアップ不要 -----------
+    lc_hi = None
+    if gs:
+        try:
+            from lc_filter import lc_bounds
+            with _timed("lc_filter"):
+                lcb = lc_bounds(gs, gens)
+            if lcb.exact is not None:
+                if verbose:
+                    print(f"  lc_filter: {lcb.sources} -> lambda = {lcb.exact}")
+                # m は決まらない (squeeze と同じ扱い)
+                return (lcb.exact, "proved", "lc_filter(rank/局所所属 + Singular bfct)")
+            lc_hi = lcb.hi
+            kw.setdefault("upper_bound", lc_hi)
+        except Exception:
+            lc_hi = None
+
     # --- イデアルを運ぶ経路 (既定で有効) -----------------------------
     lam_ideal = None
     if ideal:
@@ -1504,6 +1541,10 @@ def _rlct_certified_inner(f, gens, *, timeout_ms, max_depth, verbose,
         _LAST_CANDIDATES.extend(getattr(res, "cache_candidates", []))
     lam_poly = res.rlct
 
+    if lc_hi is not None and lam_poly is not sp.oo and lam_poly > lc_hi:
+        # 解消の値が lc_filter の健全な上界を超えている: 解消側の誤り
+        return (lc_hi, "unknown",
+                f"lc_filter 上界 {lc_hi} < 解消の値 {lam_poly} (解消側の誤り; 証明書 {cert.status})")
     if lam_ideal is not None and lam_ideal < lam_poly:
         # 小さいほうが真値に近い (どちらも上界)。ただし証明書は付かない。
         return (lam_ideal, "unknown", "ideal (多項式版より小さい値)")

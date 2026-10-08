@@ -453,11 +453,43 @@ def local_rlct_from_ideal(
     else:
         K = sp.expand(sum(g ** 2 for g in core_gens))
         kwargs = dict(prune="ties")
+        # --- lc_filter: コアイデアルの健全な上下界 ---------------------
+        lcb = None
+        try:
+            from lc_filter import lc_bounds
+            lcb = lc_bounds(core_gens, core_vars)
+            # 上界は解消には渡さない: prune='ties' と組み合わせると同値の部分木が
+            # 早く刈られて位数 m が下限に落ちる ((2,2,1,0) で m=2 -> 1)。
+            # 事後チェックだけに使う。
+        except Exception as e:                    # noqa: BLE001
+            notes.append(f"lc_filter 失敗 ({str(e)[:60]})")
         kwargs.update(resolve_kwargs)
-        resolution = resolve_singularities(K, core_vars, **kwargs)
-        lam_core, m_core = resolution.rlct, resolution.multiplicity
-        if lam_core is sp.oo:
-            lam_core, m_core = sp.Integer(0), 1
+        if lcb is not None and lcb.exact is not None:
+            lam_core, m_core = lcb.exact, 1
+            notes.append(f"コアは lc_filter で確定: lambda_core = {lcb.exact} "
+                         f"({'; '.join(lcb.sources.values())})。位数 m は未確定 (下限 1)。")
+        else:
+            try:
+                resolution = resolve_singularities(K, core_vars, **kwargs)
+            except Exception as e:                # noqa: BLE001
+                if "upper_bound" not in kwargs:
+                    raise
+                # 上界を入れると分枝限定が「真値に届く枝が無い」ことを検出して
+                # 止まることがある (解消器の探索の不完全さ)。上界なしで解き直し、
+                # 下の事後チェックに任せる。
+                notes.append(f"lc_filter の上界 {kwargs['upper_bound']} を入れた解消が"
+                             f"失敗 ({str(e)[:50]}…)。上界なしで再実行。")
+                kwargs.pop("upper_bound")
+                resolution = resolve_singularities(K, core_vars, **kwargs)
+            lam_core, m_core = resolution.rlct, resolution.multiplicity
+            if lam_core is sp.oo:
+                lam_core, m_core = sp.Integer(0), 1
+            if lcb is not None and lcb.hi is not None and lam_core > lcb.hi:
+                notes.append(f"** 解消の値 {lam_core} が lc_filter の健全な上界 {lcb.hi} を"
+                             " 超えています。解消側の誤り (certify では refuted になるはず)。"
+                             " lambda_core は上界で置き換えました (値は上界、厳密値ではない)。"
+                             " 位数 m は未確定なので 1 (下限) にしています。 **")
+                lam_core, m_core = lcb.hi, 1
 
     lam = lam_reg + lam_core
     m = m_core if core_gens else 1

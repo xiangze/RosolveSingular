@@ -1513,6 +1513,39 @@ python regression.py --all --rebuild-cache
 **上界内の誤った値が `trust_cache=False` で refuted になること**、指紋違いの
 エントリが読まれないこと、推移的な無効化、`clear()` での作り直し。
 
+### 4.7.8 `lc_filter.py` — 「λ = codim/2」の健全な上下界 (ブローアップなし)
+
+`f = Σ g_i²` の原点での λ に、解消をせずに健全な上下界を付けます。
+
+| | 内容 | 根拠 |
+|---|---|---|
+| 上界 U1 | 有理点 q ∈ X=V(g), q≠0 で rank J(q)=r、r 本 S 以外の生成元が **局所環で** (S) に属する (商イデアル (S):g_j が q で消えない元をもつ) ⇒ λ ≤ r/2 | λ_q = r/2、斉次なら λ_{sq}=λ_q で q→0、λ_0 は近傍の min |
+| 下界 L1 | rank J(0)/2 | Aoyagi Lemma 1(1) |
+| 下界 L2 | lct_C(I)/2 ≥ k·lct_C(h_1⋯h_k)/2 (h_i ∈ I) | λ_R ≥ lct_C、b 関数 (Singular `bfct`)。大域・非一般でも値は下がるだけ |
+| 下界 L3 | lct_C(f) | 同上 (f 自体、≤ 1) |
+
+- 有理点は、呼び出し側の witness か、多重線形ブロックを固定して一次方程式を
+  Q 上で解く探索で探します。r の最小値は余次元 c なので、上界は c/2 です。
+- U1 は **イデアルが斉次** のときだけです (擬斉次への拡張は可能)。
+- L2/L3 は n ≤ 3 で、上界が出ていて下界が届いていないときだけ呼びます
+  (pay-when-needed。4 変数で `bfct` が止まり、一般結合の積は 60s を超える例がある)。
+
+組み込み先:
+
+- `rlct_certified`：上下界が一致すれば経路 `lc_filter` で proved (m は未確定)。
+  解消の値が上界を超えたら上界を返して `unknown`
+- `rlct_interval`：lo/hi に合流。一致すれば解消を省略
+- `nn_rlct.local_rlct_from_ideal`：コアに適用。一致すれば解消を省略、
+  解消の値が上界を超えたら note を出して上界に置き換え
+- `resolve_singularities(upper_bound=)`：incumbent の初期値。ただし
+  `prune='ties'` と併用すると m が下限に落ちるので、nn では渡さない
+- `guards.lc_filter_tests()`
+
+縮小ランク回帰 y = BAx では、Aoyagi–Watanabe の真値が常に c/2 に一致します
+(ランク層の次元の最大化から代数的に示せる)。U1 はこの族で真値に一致する上界を
+与え、以前 nn 経路が (2,2,2,0) で黙って返していた λ=2 (certify では refuted、
+真値 3/2) を検出します。
+
 ### 4.7.5 `timing.py` — 段階別の実行時間
 
 多項式・ネットワークのサイズや次数と計算時間の関係を測るための軽量

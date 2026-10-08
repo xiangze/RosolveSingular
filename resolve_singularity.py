@@ -1087,6 +1087,7 @@ def resolve_singularities(
     newton_fast_max_vars: int = 24,
     product_split: bool = True,
     lower_bound=None,
+    upper_bound=None,
     use_cache: bool = True,
     verbose: bool = False,
 ) -> Resolution:
@@ -1272,6 +1273,10 @@ def resolve_singularities(
     lb_global = (sp.nsimplify(lower_bound) if lower_bound is not None else None)
     lb_stopped = False
     bound = float("inf")      # 大域 lambda の上界 (LP 上界 or 到達値)
+    if upper_bound is not None:
+        # 外から与えた健全な上界 (lc_filter の U1 など)。枝刈りは LB > bound の
+        # ときだけなので、真値 = upper_bound でも最小を与える chart は刈られない。
+        bound = float(upper_bound)
     achieved = float("inf")   # 実際に解消済み chart が到達した最小値
     ties_pruned = False
     prune_ties = (prune == "ties")

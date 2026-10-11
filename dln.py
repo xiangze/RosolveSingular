@@ -1,5 +1,5 @@
 r"""
-bench/dln.py — **深層線形網の厳密な λ と θ** (Aoyagi の閉形式)
+Exact Algebraic Computation of Learning Coefficients for Two-Dimensional Singular Modelsbench/dln.py — **深層線形網の厳密な λ と θ** (Aoyagi の閉形式)
 
 M. Aoyagi, *Consideration on the learning efficiency of multiple-layered
 neural networks with linear units*, Neural Networks **172**:106132 (2024).

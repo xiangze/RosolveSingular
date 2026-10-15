@@ -267,16 +267,30 @@ def _normalize(node: INode) -> INode:
 # 本体
 # ----------------------------------------------------------------------
 def resolve_ideal(generators: Sequence[sp.Expr], gens, *, max_depth: int = 14,
-                  max_nodes: int = 4000, verbose: bool = False
+                  max_nodes: int = 4000, verbose: bool = False,
+                  k0: Optional[Sequence[int]] = None,
+                  h0: Optional[Sequence[int]] = None,
                   ) -> IdealResolution:
-    """イデアルを運ぶ解消。lambda と位数を返す。
+    r"""イデアルを運ぶ解消。lambda と位数を返す。
 
     generators : 原点で消える多項式の列 (f = sum g_i^2 に対応)
+    k0, h0     : **親の chart から引き継いだ指数**。この節点の局所問題が
+        すでに f = x^{k0} (...) の形で、ヤコビアンが |det| = x^{h0} (単元)
+        になっている場合に渡す。
+
+        これを渡さないと h = 0 として計算するので**別の問題を解くことに
+        なる**。λ = min_j (h_j+1)/k_j なので h は値に直接効く: 実測では
+        Vandermonde の chart 問題で h0=[5,0,...] を渡すと 7/6、渡さないと
+        1/4 になった。chart の局所問題を外から渡すときは必ず指定すること。
     """
     gens = tuple(gens)
     n = len(gens)
+    kk = list(k0) if k0 is not None else [0] * n
+    hh = list(h0) if h0 is not None else [0] * n
+    if len(kk) != n or len(hh) != n:
+        raise ValueError(f"k0/h0 の長さが変数の数 {n} と合いません")
     root = INode("C0", [sp.expand(g) for g in generators if sp.expand(g) != 0],
-                 gens, [0] * n, [0] * n, sp.Integer(0), 0)
+                 gens, kk, hh, sp.Integer(0), 0)
     stack = [root]
     leaves: List[Tuple[str, sp.Rational, int, str]] = []
     n_nodes = 0

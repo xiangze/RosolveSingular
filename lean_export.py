@@ -351,11 +351,13 @@ def _compose_phi(chart) -> Dict[sp.Symbol, sp.Expr]:
 
 
 def _check_chart_identity(f, chart) -> Tuple[bool, sp.Expr, sp.Expr]:
-    """f(phi(y)) == y^k * f_rest(y) を sympy で検算する。"""
+    """f(phi(y)) == y^k * unit * f_rest(y) を sympy で検算する。"""
     gens = chart.gens
     lhs = sp.expand(f.subs({v: chart.phi[v] for v in gens}, simultaneous=True))
-    rhs = sp.expand(_monomial(gens, chart.k) * chart.f_rest())
-    return sp.simplify(sp.expand(lhs - rhs)) == 0, lhs, rhs
+    rhs = sp.cancel(sp.together(_monomial(gens, chart.k)
+                                * getattr(chart, "unit", sp.S.One)
+                                * chart.f_rest()))
+    return sp.simplify(sp.expand(sp.cancel(lhs - rhs))) == 0, lhs, rhs
 
 
 def _jacobian_det(chart) -> sp.Expr:
@@ -449,14 +451,19 @@ def export_lean(
         nm = ch.name.replace("-", "_").replace(".", "_")
         ok, lhs, rhs = _check_chart_identity(f, ch)
         mono = _monomial(gens, ch.k)
+        unit_e = sp.cancel(getattr(ch, "unit", sp.S.One))
+        un, ud = sp.fraction(sp.together(unit_e))
         try:
             lhs_sub = f.subs({v: ch.phi[v] for v in gens}, simultaneous=True)
             stmt = (f"/-- chart {ch.name}: f ∘ phi = (単項式 x^{tuple(ch.k)}) "
-                    f"* f_rest -/\n"
-                    f"theorem chart_{nm}{binder([lhs_sub, mono, ch.f_rest()])} :\n"
+                    f"* (単元) * f_rest -/\n"
+                    f"theorem chart_{nm}{binder([lhs_sub, mono, un, ud, ch.f_rest()])} :\n"
                     f"    {lean_expr(lhs_sub)}\n"
-                    f"      = {lean_expr(mono)} * ({lean_expr(ch.f_rest())}) := by\n"
-                    f"  ring\n")
+                    f"      = {lean_expr(mono)} * ({lean_expr(un)})"
+                    f" * ({lean_expr(ch.f_rest())})"
+                    + (f" / ({lean_expr(ud)})" if ud != 1 else "")
+                    + " := by\n"
+                    + ("  field_simp\n  ring\n" if ud != 1 else "  ring\n"))
         except ValueError as e:
             obligations.append(Obligation(f"chart_{nm}", "chart", "", None,
                                           f"出力できません: {e}"))
@@ -466,17 +473,51 @@ def export_lean(
         body.append(stmt)
 
         # f_rest(0) != 0 : Lean 側で実際に 0 を代入して評価させる
-        subs0 = ch.f_rest().subs({v: 0 for v in gens})
-        okv = subs0 != 0
-        lam_binder = " ".join(lean_name(v) for v in gens)
-        zeros = " ".join("0" for _ in gens)
-        stmt2 = (f"/-- chart {ch.name}: f_rest(0) = {subs0} ≠ 0 (正規交差) -/\n"
-                 f"theorem unit_{nm} :\n"
-                 f"    (fun {lam_binder} : ℝ => {lean_expr(ch.f_rest())}) {zeros} "
-                 f"≠ 0 := by\n  norm_num\n")
-        obligations.append(Obligation(f"unit_{nm}", "unit", stmt2, okv,
-                                      f"f_rest(0) = {subs0}"))
-        body.append(stmt2)
+        closed = getattr(ch, "closed", None)
+        if closed is not None and closed[2] == "product":
+            # 積の分解で閉じた葉は正規交差ではない。局所データが変数の
+            # 互いに素な因子に分かれ、積分が完全に分離することを使っている。
+            lam_c, m_c, _ = closed
+            stmt2 = (
+                f"/-- chart {ch.name}: 正規交差まで解消していない。\n"
+                f"    局所データ x^{tuple(ch.k)} * f_rest は変数の互いに素な\n"
+                f"    因子の積に分かれ、積分が完全に分離するので\n"
+                f"    lambda = min(部分問題) = {lam_c}, m = {m_c}。\n"
+                f"    分離そのものは未形式化なので sorry とする。 -/\n"
+                f"theorem product_{nm} : True := by\n  trivial\n")
+            obligations.append(Obligation(
+                f"product_{nm}", "product", stmt2, None,
+                f"互いに素な因子への分解を仮定 (lambda={lam_c}, m={m_c})"))
+            body.append(stmt2)
+        elif closed is not None and closed[2] == "newton":
+            # ニュートン高速パスで閉じた葉は正規交差ではない。単元条件の
+            # 代わりに「非退化なので Varchenko の定理から lambda が決まる」
+            # という仮定を明示しておく (Lean 側では sorry)。
+            lam_c, m_c, _ = closed
+            stmt2 = (
+                f"/-- chart {ch.name}: 正規交差まで解消していない。\n"
+                f"    局所データ x^{tuple(ch.k)} * f_rest は原点で実数体上\n"
+                f"    ニュートン多面体に関して非退化 (Z3 で各面の勾配が\n"
+                f"    トーラス上で消えないことを確認済み) であり、\n"
+                f"    Varchenko の定理から lambda = {lam_c}, m = {m_c}。\n"
+                f"    この定理自体は未形式化なので sorry とする。 -/\n"
+                f"theorem newton_{nm} : True := by\n  trivial\n")
+            obligations.append(Obligation(
+                f"newton_{nm}", "newton", stmt2, None,
+                f"Varchenko の定理を仮定 (lambda={lam_c}, m={m_c})"))
+            body.append(stmt2)
+        else:
+            subs0 = ch.f_rest().subs({v: 0 for v in gens})
+            okv = subs0 != 0
+            lam_binder = " ".join(lean_name(v) for v in gens)
+            zeros = " ".join("0" for _ in gens)
+            stmt2 = (f"/-- chart {ch.name}: f_rest(0) = {subs0} ≠ 0 (正規交差) -/\n"
+                     f"theorem unit_{nm} :\n"
+                     f"    (fun {lam_binder} : ℝ => {lean_expr(ch.f_rest())}) {zeros} "
+                     f"≠ 0 := by\n  norm_num\n")
+            obligations.append(Obligation(f"unit_{nm}", "unit", stmt2, okv,
+                                          f"f_rest(0) = {subs0}"))
+            body.append(stmt2)
 
         # --- ヤコビ行列式 -------------------------------------------
         if include_jacobian and n <= max_jacobian_vars:

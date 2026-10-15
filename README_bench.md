@@ -71,4 +71,20 @@ OK に変わるので、その時点で通常のガードに昇格させる。
 * ランダム 111 件 (n<=3, d<=6): proved 111/111
 * ランダム 36 件 (n=4-5, d=4-8): proved 22/36、失敗は全て `resolve_max_depth`
 * ニューラルネット 54 件: proved 39、コア 0-3 変数なら 100%、4 変数で 50%、5 以上で 0%
-* guards 44 件: 全緑
+* guards 169 件: 全緑 (既知の未修正バグ 1 件はゲート外)
+
+## キャッシュを貯める
+
+```sh
+python build_cache.py --relu             # 中小規模 ReLU のコアを貯める
+python build_cache.py --relu --rebuild   # 1 から作り直す
+python build_cache.py --stats            # 中身と当たりの多いエントリを見る
+```
+
+`relu_specs()` が (widths, 退化の型, データ点数, 種) の一覧を返し、
+`case_from_spec()` が必要な分だけ式を作ります。**データ点が多いほうがコアが
+残る**ので、既定の n_data は (8, 10, 12, 16) です。
+
+多項式スイートを独立な検査として使いたいときは `--cache off` か
+`--verify-cache` を付けてください。`regression.py` の guards は常に
+キャッシュ抜きで走ります。

@@ -87,6 +87,16 @@ from resolve_singularity import (
     resolve_singularities,
 )
 
+try:
+    from timing import timed as _timed
+except Exception:      # pragma: no cover
+    from contextlib import contextmanager as _cm
+
+    @_cm
+    def _timed(_name):
+        yield
+
+
 __all__ = [
     "LocalRLCT",
     "local_rlct_from_ideal",
@@ -112,6 +122,7 @@ class LocalRLCT:
     lam_core: sp.Rational = sp.Integer(0)
     m_core: int = 1
     resolution: Optional[Resolution] = None
+    core_route: str = ""      # 'resolve' | 'newton' | 'empty'
     notes: List[str] = field(default_factory=list)
 
     def report(self) -> str:
@@ -289,82 +300,151 @@ def _gauge_fix(symmetry_vectors, variables):
     return pivot_vars, list(pivots[:used_rows])
 
 
+def _regular_candidates(gens, variables):
+    """原点で正則な (生成元, 変数) の候補を、安い順に並べて返す。
+
+    g = A*v + B (A, B は v を含まない) と書け、**A が原点で非零**なら、
+    局所環で A は単元なので v を消去できる。候補ごとの消去コストは
+    A, B の大きさでほぼ決まるので、
+
+      (1) A が定数 (このとき sol = -B/A は多項式で、A の冪が要らない)
+      (2) A, B の項数が小さい
+
+    の順で並べる。順序を選ぶだけで中間式の膨張がまったく違う。
+
+    Returns [(score, gi, v, A, B), ...] (score の昇順)
+    """
+    out = []
+    zero = {w: 0 for w in variables}
+    idx = {v: i for i, v in enumerate(variables)}
+    for gi, g in enumerate(gens):
+        try:
+            P = sp.Poly(g, *variables)
+        except sp.PolynomialError:
+            continue
+        monoms, coeffs = P.monoms(), P.coeffs()
+        for v in variables:
+            j = idx[v]
+            if P.coeff_monomial(v) == 0:
+                continue                 # 原点で v について 1 次の項が無い
+            if max(m[j] for m in monoms) != 1:
+                continue                 # v について 1 次でない
+            # A = d g / d v (v を含まない), B = g|_{v=0}
+            At, Bt = [], []
+            for m, c in zip(monoms, coeffs):
+                term = c * sp.prod([w ** e for w, e in zip(variables, m)
+                                    if w is not v])
+                (At if m[j] == 1 else Bt).append(term)
+            A = sp.expand(sp.Add(*At)) if At else sp.S.Zero
+            if A == 0 or sp.expand(A.subs(zero)) == 0:
+                continue                 # A(0) = 0 -> 原点で正則でない
+            B = sp.expand(sp.Add(*Bt)) if Bt else sp.S.Zero
+            na = 1 if A.is_number else len(sp.Add.make_args(A))
+            nb = 1 if B.is_number else len(sp.Add.make_args(B))
+            out.append(((0 if A.is_number else 1, na * nb, na + nb), gi, v, A, B))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def _pseudo_substitute(h, v, A, B, variables):
+    """v = -B/A を h に代入し、分母を払った多項式 (擬剰余) を返す。
+
+    h = sum_e c_e(others) v^e に対し
+
+        A^d * h(-B/A) = sum_e c_e (-B)^e A^{d-e}         (d = deg_v h)
+
+    を Horner 法で組む。**有理式を経由しない**ので sp.cancel /
+    sp.together が要らない。A は原点で単元なので A^d を掛けても局所環では
+    イデアルは変わらず、RLCT も変わらない。
+
+    仕上げに整数の content を割る (単元倍なのでイデアルは不変)。
+    代入を有理式で行うと係数が 28 桁まで膨らみ、cancel が支配的コストに
+    なっていた (実測 19.7 秒のうち cancel が 10.7 秒)。
+    """
+    others = [w for w in variables if w is not v]
+    try:
+        hp = sp.Poly(h, v)
+    except sp.PolynomialError:
+        return None
+    d = hp.degree()
+    if d <= 0:
+        return sp.expand(h)
+    # 係数 c_d, ..., c_0 (v を含まない)
+    cs = [sp.S.Zero] * (d + 1)
+    for (e,), c in zip(hp.monoms(), hp.coeffs()):
+        cs[e] = c
+    if others:
+        R = lambda e: sp.Poly(sp.expand(e), *others)
+        Ap, Bp = R(A), R(-B)
+        acc = R(cs[d])
+        pw = sp.Poly(1, *others)
+        for e in range(d - 1, -1, -1):
+            pw = pw * Ap
+            acc = acc * Bp + R(cs[e]) * pw
+        num = acc.as_expr()
+    else:
+        acc = cs[d]
+        pw = sp.S.One
+        for e in range(d - 1, -1, -1):
+            pw = pw * A
+            acc = sp.expand(acc * (-B) + cs[e] * pw)
+        num = sp.expand(acc)
+    num = sp.expand(num)
+    if num == 0:
+        return sp.S.Zero
+    # 整数 content を割る (非零の有理数倍なのでイデアルは変わらない)
+    try:
+        c, pp = sp.Poly(num, *others).primitive() if others else (1, None)
+        if pp is not None and c != 0:
+            num = pp.as_expr()
+    except Exception:
+        pass
+    return num
+
+
 def _eliminate_regular(gens, variables, verbose=False):
     """原点で微分が非零な生成元を使って正則方向を消去する。
 
-    g が変数 v について 1 次で、その係数が原点で非零なら v = sol を他の
-    生成元に代入し、v と g を落として lambda に 1/2 を加える。
+    g = A*v + B で A(0) != 0 なら、局所環で A は単元なので v を消去でき、
+    lambda に 1/2 を加える (nn_rlct.py 冒頭の「正則方向の消去」を参照)。
+
+    代入は有理式ではなく**擬剰余 (多項式)** で行う (_pseudo_substitute)。
+    また候補は「A が定数」「A, B が小さい」順に選ぶ。どちらも値を変えず、
+    中間式の膨張だけを抑える。
     """
     gens = [sp.expand(g) for g in gens if g != 0]
     variables = list(variables)
     eliminated: List[sp.Symbol] = []
-    progress = True
-    while progress and gens:
-        progress = False
-        # 各生成元の Poly を一度だけ作る。sp.simplify や subs を変数ごとに
-        # 呼ぶと assumption の推論 (deduce_all_facts) が支配的コストになる。
-        polys = []
-        for g in gens:
-            try:
-                polys.append(sp.Poly(g, *variables))
-            except sp.PolynomialError:
-                polys.append(None)
-        for gi, (g, P) in enumerate(zip(gens, polys)):
-            if P is None:
+
+    while gens and variables:
+        used = None
+        for _score, gi, v, A, B in _regular_candidates(gens, variables):
+            new_gens = []
+            ok = True
+            for hj, h in enumerate(gens):
+                if hj == gi:
+                    continue
+                num = _pseudo_substitute(h, v, A, B, variables)
+                if num is None:
+                    ok = False
+                    break
+                if num != 0:
+                    new_gens.append(num)
+            if not ok:
                 continue
-            # 原点での線形係数 = 単項式 v の係数
-            cand = [v for v in variables if P.coeff_monomial(v) != 0]
-            if not cand:
-                continue
-            for v in cand:
-                pg = sp.Poly(g, v)
-                if pg.degree() != 1:
-                    continue
-                A = pg.coeff_monomial(v)
-                B = pg.coeff_monomial(1)
-                if A == 0:
-                    continue
-                sol = sp.cancel(-B / A)
-                others = [w for w in variables if w != v]
-                fast = A.is_number and others
-                new_gens = []
-                ok = True
-                for hj, h in enumerate(gens):
-                    if hj == gi:
-                        continue
-                    num = None
-                    if fast:
-                        try:
-                            hp = sp.Poly(h, v)
-                            solp = sp.Poly(sp.expand(sol), *others)
-                            acc = sp.Poly(0, *others)
-                            for (e_,), c_ in zip(hp.monoms(), hp.coeffs()):
-                                acc = acc + sp.Poly(c_, *others) * solp ** e_
-                            num = acc.as_expr()
-                        except Exception:
-                            num = None
-                    if num is None:
-                        hh = sp.cancel(sp.together(h.subs(v, sol)))
-                        num, den = sp.fraction(hh)
-                        if den.subs({w: 0 for w in variables}) == 0:
-                            ok = False
-                            break
-                        num = sp.expand(num)
-                    if num != 0:
-                        new_gens.append(num)
-                if not ok:
-                    continue
-                # ループ内で毎回簡約する。外に出すと生成元が増えたまま
-                # 次の代入が走り、かえって遅くなる (実測で 15 -> 19 秒)。
-                gens = _linear_reduce(new_gens, variables)
-                variables = [w for w in variables if w != v]
-                eliminated.append(v)
-                if verbose:
-                    print(f"    [regular] {v} = {sol} を消去")
-                progress = True
-                break
-            if progress:
-                break
+            used = (gi, v, new_gens)
+            break
+        if used is None:
+            break
+        gi, v, new_gens = used
+        variables = [w for w in variables if w is not v]
+        # ループ内で毎回簡約する。外に出すと生成元が増えたまま次の代入が
+        # 走り、かえって遅くなる (実測で 15 -> 19 秒)。
+        gens = _linear_reduce(new_gens, variables)
+        eliminated.append(v)
+        if verbose:
+            print(f"    [regular] {v} を消去 (残り {len(gens)} 生成元, "
+                  f"{len(variables)} 変数)")
     return gens, variables, eliminated
 
 
@@ -377,6 +457,8 @@ def local_rlct_from_ideal(
     *,
     symmetry_vectors: Sequence[Dict[sp.Symbol, sp.Expr]] = (),
     verbose: bool = False,
+    dln_oracle: bool = True,
+    dln_hint: Optional[Tuple[Sequence[int], int]] = None,
     **resolve_kwargs,
 ) -> LocalRLCT:
     """fiber ideal <generators> の原点における局所 RLCT。
@@ -385,11 +467,42 @@ def local_rlct_from_ideal(
     variables  : theta - theta* に対応する変数
     symmetry_vectors : theta* における連続対称性の接ベクトル
         (変数 -> 成分 の dict)。自由な作用のものだけを渡すこと。
+    dln_oracle : 深層線形網の閉形式オラクルを試すか (既定 True)。
+        イデアルを DLN のものと**確認できた場合だけ**発火する
+        (detect -> reconstruct -> compare; dln_oracle.py 参照)。
+    dln_hint : (H, r) を宣言してオラクルを使う。宣言は検証されるので
+        誤った宣言で誤った lambda が出ることはない。r > 0 や L >= 4 は
+        この経路でのみ扱える。
     resolve_kwargs : resolve_singularities に渡す (prune, max_depth, ...)
     """
     variables = list(variables)
     n0 = len(variables)
     notes: List[str] = []
+
+    # --- 深層線形網の閉形式オラクル -----------------------------------
+    # 構造を壊す簡約の前、生成元がそのままの段階で試す。
+    if dln_oracle or dln_hint is not None:
+        try:
+            from dln_oracle import dln_route as _dln_route
+            _hit = _dln_route([sp.expand(g) for g in generators], variables,
+                              hint=dln_hint)
+        except Exception:
+            _hit = None
+        if _hit is not None:
+            _lam, _th, _m = _hit
+            notes.append(
+                f"深層線形網として同定 (H={tuple(_m.H)}, r={_m.r}, "
+                f"同定経路={_m.how}): Aoyagi の閉形式 "
+                "(Neural Networks 172:106132, Thm 1) を適用。"
+                "イデアルを組み直して入力と厳密に一致することを確認済み。")
+            if verbose:
+                print(f"  [dln] H={tuple(_m.H)} r={_m.r} -> "
+                      f"lambda={_lam}, m={_th}")
+            return LocalRLCT(rlct=sp.nsimplify(_lam), multiplicity=int(_th),
+                             n_vars_initial=n0, core_vars=list(variables),
+                             core_gens=[sp.expand(g) for g in generators],
+                             lam_core=sp.nsimplify(_lam), m_core=int(_th),
+                             core_route="dln", notes=notes)
 
     gens = []
     for g in generators:
@@ -436,8 +549,10 @@ def local_rlct_from_ideal(
                          free_vars=free_vars, gauge_fixed=gauge_vars, notes=notes)
 
     # --- 正則方向の消去 ----------------------------------------------
-    core_gens, core_vars, regular = _eliminate_regular(gens, variables, verbose=verbose)
-    core_gens = _linear_reduce(core_gens, core_vars)
+    with _timed("eliminate_regular"):
+        core_gens, core_vars, regular = _eliminate_regular(
+            gens, variables, verbose=verbose)
+        core_gens = _linear_reduce(core_gens, core_vars)
     lam_reg = sp.Rational(len(regular), 2)
 
     # 消去で使われなくなった変数を整理
@@ -447,49 +562,112 @@ def local_rlct_from_ideal(
 
     # --- コアイデアルの解消 ------------------------------------------
     resolution = None
+    core_route = "empty"
     if not core_gens:
         lam_core, m_core = sp.Integer(0), 1
         notes.append("コアイデアルは空 (正則な特異点): lambda は正則方向のみで決まる。")
     else:
         K = sp.expand(sum(g ** 2 for g in core_gens))
-        kwargs = dict(prune="ties")
+        # まず K 全体がニュートン非退化かを見る。非退化なら Varchenko の
+        # 定理で lambda が厳密に決まるので、ブローアップは要らない
+        # (LP + 有限個の Z3 判定だけなので、変数が多いほど効く)。
+        lam_core = m_core = None
+        try:
+            from certify import newton_multiplicity, rlct_via_newton
+            with _timed("newton"):
+                lam_n, st_n = rlct_via_newton(K, core_vars, timeout_ms=8000)
+            if st_n == "proved" and lam_n is not sp.oo:
+                m_n = newton_multiplicity(K, core_vars)
+                lam_core, m_core = lam_n, (int(m_n) if m_n else 1)
+                core_route = "newton"
+                notes.append("コアはニュートン非退化: Varchenko の定理で厳密。")
+        except Exception:
+            lam_core = m_core = None
+        # つぎに Aoyagi Lemma 1(1) の挟み込み。部分生成元の lambda は
+        # 全体の lambda の厳密な下界で、newton_rlct は常に上界なので、
+        # 一致すればブローアップなしで確定する。一致しなくても下界は
+        # 分枝限定の早期終了に使える (位数 m は下限になる)。
+        lb = None
+        if lam_core is None and len(core_gens) >= 2:
+            try:
+                from lemmas import squeeze_rlct
+                sq = squeeze_rlct(K, core_vars, core_gens)
+                if sq.status == "proved":
+                    lam_core, m_core = sq.rlct, 1
+                    core_route = "squeeze"
+                    notes.append(
+                        f"挟み込みで確定: lambda ∈ [{sq.lo}, {sq.hi}] が一致 "
+                        f"({sq.witness})。位数 m は下限。")
+                elif sq.status != "inconsistent":
+                    lb = sq.lo
+            except Exception:
+                lb = None
         # --- lc_filter: コアイデアルの健全な上下界 ---------------------
+        # 上界 U1 (ヤコビアンの階数 + 商イデアルの (S) 判定) と下界 L2
+        # (b 関数から lct_C、lambda_R >= lct_C) の挟み込み。一致すれば
+        # 解消なしで確定する。一致しなくても **上界は健全** なので、
+        # 解消の値がそれを超えたら解消側の誤りとして検出できる。
         lcb = None
         try:
             from lc_filter import lc_bounds
             lcb = lc_bounds(core_gens, core_vars)
-            # 上界は解消には渡さない: prune='ties' と組み合わせると同値の部分木が
-            # 早く刈られて位数 m が下限に落ちる ((2,2,1,0) で m=2 -> 1)。
-            # 事後チェックだけに使う。
-        except Exception as e:                    # noqa: BLE001
+        except ImportError:
+            lcb = None                 # lc_filter.py が無い環境では飛ばす
+        except Exception as e:         # noqa: BLE001
             notes.append(f"lc_filter 失敗 ({str(e)[:60]})")
-        kwargs.update(resolve_kwargs)
-        if lcb is not None and lcb.exact is not None:
+        if lam_core is None and lcb is not None and lcb.exact is not None:
             lam_core, m_core = lcb.exact, 1
+            core_route = "lc_filter"
             notes.append(f"コアは lc_filter で確定: lambda_core = {lcb.exact} "
-                         f"({'; '.join(lcb.sources.values())})。位数 m は未確定 (下限 1)。")
-        else:
+                         f"({'; '.join(lcb.sources.values())})。"
+                         "位数 m は未確定 (下限 1)。")
+        if lam_core is None:
+            # 上界は解消に渡さない: prune='ties' と組み合わせると同値の
+            # 部分木が早く刈られて位数 m が下限に落ちる ((2,2,1,0) で
+            # m=2 -> 1)。事後チェックだけに使う。
+            kwargs = dict(prune="ties", lower_bound=lb)
+            kwargs.update(resolve_kwargs)
             try:
-                resolution = resolve_singularities(K, core_vars, **kwargs)
-            except Exception as e:                # noqa: BLE001
-                if "upper_bound" not in kwargs:
+                with _timed("resolve"):
+                    resolution = resolve_singularities(K, core_vars, **kwargs)
+                lam_core, m_core = resolution.rlct, resolution.multiplicity
+                core_route = "resolve"
+            except ResolutionFailure:
+                # 解消が失敗したときだけ挟み込みに大きな予算を与える
+                # (pay-when-needed)。だめなら例外はそのまま伝える。
+                ok = False
+                if len(core_gens) >= 2:
+                    try:
+                        from lemmas import squeeze_rlct
+                        sq2 = squeeze_rlct(K, core_vars, core_gens,
+                                           max_subset=2, max_calls=24,
+                                           time_budget=8.0)
+                        if sq2.status == "proved":
+                            lam_core, m_core = sq2.rlct, 1
+                            core_route = "squeeze(解消失敗後)"
+                            notes.append(
+                                f"解消は失敗したが挟み込みで確定: "
+                                f"lambda ∈ [{sq2.lo}, {sq2.hi}] ({sq2.witness})。"
+                                "位数 m は下限。")
+                            ok = True
+                    except Exception:
+                        ok = False
+                if not ok:
                     raise
-                # 上界を入れると分枝限定が「真値に届く枝が無い」ことを検出して
-                # 止まることがある (解消器の探索の不完全さ)。上界なしで解き直し、
-                # 下の事後チェックに任せる。
-                notes.append(f"lc_filter の上界 {kwargs['upper_bound']} を入れた解消が"
-                             f"失敗 ({str(e)[:50]}…)。上界なしで再実行。")
-                kwargs.pop("upper_bound")
-                resolution = resolve_singularities(K, core_vars, **kwargs)
-            lam_core, m_core = resolution.rlct, resolution.multiplicity
-            if lam_core is sp.oo:
-                lam_core, m_core = sp.Integer(0), 1
-            if lcb is not None and lcb.hi is not None and lam_core > lcb.hi:
-                notes.append(f"** 解消の値 {lam_core} が lc_filter の健全な上界 {lcb.hi} を"
-                             " 超えています。解消側の誤り (certify では refuted になるはず)。"
-                             " lambda_core は上界で置き換えました (値は上界、厳密値ではない)。"
-                             " 位数 m は未確定なので 1 (下限) にしています。 **")
-                lam_core, m_core = lcb.hi, 1
+        if lam_core is sp.oo:
+            lam_core, m_core = sp.Integer(0), 1
+        # --- 解消の値が lc_filter の健全な上界を超えていないか ---------
+        # 超えていたら解消側の誤り (certify では refuted になるはず)。
+        # 値は健全な上界で置き換え、厳密値ではないことを note に残す。
+        if (lcb is not None and lcb.hi is not None
+                and core_route not in ("lc_filter",) and lam_core > lcb.hi):
+            notes.append(
+                f"** 解消の値 {lam_core} が lc_filter の健全な上界 {lcb.hi} を"
+                " 超えています。解消側の誤り (certify では refuted になるはず)。"
+                " lambda_core は上界で置き換えました (値は上界、厳密値ではない)。"
+                " 位数 m は未確定なので 1 (下限) にしています。 **")
+            lam_core, m_core = lcb.hi, 1
+            core_route += "+lc_filter上界で訂正"
 
     lam = lam_reg + lam_core
     m = m_core if core_gens else 1
@@ -502,6 +680,7 @@ def local_rlct_from_ideal(
         gauge_fixed=gauge_vars,
         regular_vars=regular,
         core_vars=core_vars,
+        core_route=core_route,
         core_gens=core_gens,
         lam_regular=lam_reg,
         lam_core=lam_core,

@@ -248,9 +248,30 @@ def _pick_backend(backend: str, hot: bool = False) -> str:
         if not _HAS_SCIPY:
             raise RuntimeError("scipy がインストールされていません")
         return "scipy"
-    if hot:
-        return "scipy" if _HAS_SCIPY else ("pulp" if _HAS_PULP else "none")
-    return "pulp" if _HAS_PULP else ("scipy" if _HAS_SCIPY else "none")
+    # in-process の scipy(HiGHS) を常に優先する。CBC は解くたびに
+    # サブプロセスを起動するので、初回 585ms / 以降 5.6ms に対し
+    # scipy は 1.7ms (実測)。LP は整数制約がないので HiGHS で十分。
+    del hot                              # 既存の呼び出し互換のため残す
+    return "scipy" if _HAS_SCIPY else ("pulp" if _HAS_PULP else "none")
+
+
+def _lp_var(name: str, *, low=None, cat=None):
+    """pulp の LpVariable を版差を吸収して作る。
+
+    pulp 4.0 で lowBound= キーワードが通らない環境が報告されているので、
+    lowBound -> low_bound -> 位置引数 の順に試す。
+    """
+    kw = {}
+    if cat is not None:
+        kw["cat"] = cat
+    if low is None:
+        return _pulp.LpVariable(name, **kw)
+    for key in ("lowBound", "low_bound"):
+        try:
+            return _pulp.LpVariable(name, **{key: low}, **kw)
+        except TypeError:
+            continue
+    return _pulp.LpVariable(name, low, **kw)
 
 
 def _lp_newton_value(monoms: Sequence[Sequence[int]],
@@ -281,7 +302,7 @@ def _lp_newton_value(monoms: Sequence[Sequence[int]],
 
     if which == "pulp":
         prob = _pulp.LpProblem("newton_rlct", _pulp.LpMaximize)
-        nu = [_pulp.LpVariable(f"nu{a}", lowBound=0) for a in range(N)]
+        nu = [_lp_var(f"nu{a}", low=0) for a in range(N)]
         prob += _pulp.lpSum(nu)
         for j in range(n):
             coeffs = [(nu[a], monoms[a][j]) for a in range(N) if monoms[a][j]]
@@ -308,6 +329,36 @@ def _lp_newton_value(monoms: Sequence[Sequence[int]],
     return float("inf")              # ソルバーが無ければ上界なし (枝刈りしない)
 
 
+def _ilp_min_hitting_set_scipy(supports: Sequence[frozenset],
+                               n: int) -> Optional[List[int]]:
+    """最小ヒッティング集合を scipy.optimize.milp (HiGHS) で解く。
+
+    CBC と違ってプロセス起動がないので、初回 585ms の立ち上がりが消える
+    (実測 2.7ms/回)。整数最適解なので結果は CBC と同じ。
+    """
+    try:
+        import numpy as np
+        from scipy.optimize import Bounds, LinearConstraint, milp
+    except Exception:
+        return None
+    A = np.zeros((len(supports), n))
+    for i, S in enumerate(supports):
+        for j in S:
+            if 0 <= j < n:
+                A[i, j] = 1.0
+    if not A.any(axis=1).all():
+        return None                  # 空の台 -> 被覆不能。呼び出し側に委ねる
+    try:
+        res = milp(c=np.ones(n),
+                   constraints=LinearConstraint(A, lb=1.0, ub=np.inf),
+                   integrality=np.ones(n), bounds=Bounds(0, 1))
+    except Exception:
+        return None
+    if not res.success or res.x is None:
+        return None
+    return sorted(j for j in range(n) if res.x[j] > 0.5)
+
+
 def _ilp_min_hitting_set(supports: Sequence[frozenset], n: int,
                          backend: str = "auto") -> Optional[List[int]]:
     """最小ヒッティング集合 (集合被覆) を 0-1 整数計画として解く。
@@ -315,14 +366,20 @@ def _ilp_min_hitting_set(supports: Sequence[frozenset], n: int,
         minimize  sum_j z_j
         s.t.      sum_{j in S} z_j >= 1  (各単項式の台 S),  z_j in {0,1}
 
-    pulp (既定では CBC) に投げる。解けなければ None を返し、呼び出し側の
-    分枝限定にフォールバックする。
+    in-process の scipy.optimize.milp (HiGHS) を優先し、無ければ pulp
+    (CBC) に投げる。解けなければ None を返し、呼び出し側の分枝限定に
+    フォールバックする。
     """
-    which = _pick_backend(backend)
-    if which != "pulp":
+    if not supports:
+        return []
+    if backend in ("auto", "scipy") and _HAS_SCIPY:
+        r = _ilp_min_hitting_set_scipy(supports, n)
+        if r is not None or backend == "scipy":
+            return r
+    if not _HAS_PULP:
         return None
     prob = _pulp.LpProblem("min_center", _pulp.LpMinimize)
-    z = {j: _pulp.LpVariable(f"z{j}", cat="Binary") for j in range(n)}
+    z = {j: _lp_var(f"z{j}", cat="Binary") for j in range(n)}
     prob += _pulp.lpSum(z.values())
     for S in supports:
         prob += _pulp.lpSum(z[j] for j in S) >= 1
@@ -913,25 +970,122 @@ def _offorigin_centers(chart: Chart, max_solutions: int = 4):
 
 _FACTOR_CACHE: Dict[str, object] = {}
 
+# 因数分解のバックエンド。"auto" は flint があれば flint、なければ sympy。
+# "sympy" / "flint" を指定すると固定できる (guard の突き合わせ用)。
+FACTOR_BACKEND = "auto"
+
+try:
+    import flint as _flint
+    _HAS_FLINT = True
+except Exception:                                    # pragma: no cover
+    _flint = None
+    _HAS_FLINT = False
+
+# flint 側で使える上限は sympy よりずっと大きく取れる (実測 60-137 倍)。
+_MAX_TERMS_FLINT = 4000
+
+
+def _flint_factor_list(expr):
+    """sympy の factor_list と同じ形 (coeff, [(因子, 重複度), ...]) を
+    python-flint の fmpq_mpoly.factor() で返す。
+
+    **健全性の向き**: これは因数分解そのもの (等式変形) で、近似も
+    片側だけの判定も入っていない。入力を扱えない場合は None を返し、
+    呼び出し側は sympy に落ちる。扱えるのは
+
+      * 生成元が全て互いに異なる名前の Symbol
+      * 係数が全て有理数
+
+    の場合だけ。flint の規約 (原始的な整数係数因子・符号は定数側・
+    重複度はまとめる) は sympy と一致することを確認済みで、
+    並び順だけが違う。guard で全コーパスを sympy と突き合わせている。
+    """
+    if not _HAS_FLINT:
+        return None
+    expr = sp.sympify(expr)
+    if expr.is_number:
+        # 定数は因子を持たない。sympy の factor_list(7) = (7, []) に合わせる。
+        c = sp.nsimplify(expr)
+        return (c, []) if isinstance(c, sp.Rational) else None
+    try:
+        p = sp.Poly(expr)
+    except Exception:
+        return None
+    gens = p.gens
+    names = []
+    for g in gens:
+        if not isinstance(g, sp.Symbol):
+            return None
+        names.append(g.name)
+    if len(set(names)) != len(names):
+        return None
+    if len(p.monoms()) > _MAX_TERMS_FLINT:
+        return None
+    try:
+        d = {}
+        for mon, c in zip(p.monoms(), p.coeffs()):
+            cr = sp.nsimplify(c) if not isinstance(c, sp.Rational) else c
+            if not isinstance(cr, sp.Rational):
+                return None
+            d[tuple(int(e) for e in mon)] = _flint.fmpq(int(cr.p), int(cr.q))
+        if not d:
+            return None
+        ctx = _flint.fmpq_mpoly_ctx.get(names, _flint.Ordering.lex)
+        coeff, facs = ctx.from_dict(d).factor()
+    except Exception:
+        return None
+    try:
+        out = []
+        for g, mult in facs:
+            terms = {}
+            for mon, c in zip(g.monoms(), g.coeffs()):
+                terms[tuple(int(e) for e in mon)] = sp.Rational(int(c.p),
+                                                                int(c.q))
+            out.append((sp.Poly.from_dict(terms, *gens).as_expr(), int(mult)))
+        c0 = sp.Rational(int(coeff.p), int(coeff.q))
+    except Exception:
+        return None
+    return (c0, out)
+
 
 def _cached_factor_list(expr, max_terms: int = 80):
     """factor_list はコストが高く、同じ多項式に対して複数回呼ばれるので
     キャッシュする。項数が多いものは因数分解の効果より costs が上回るので
     諦める (単元因子の除去も滑らかな因子の座標化も「できなければ
-    ブローアップに回る」だけで正しさには影響しない)。"""
+    ブローアップに回る」だけで正しさには影響しない)。
+
+    python-flint が入っていれば因数分解自体はそちらに回す。これは等式
+    変形なので片側だけ健全という話はなく、扱えない入力では None を返して
+    sympy に落ちる。sympy 側は参照実装として残し、guard で全コーパスを
+    突き合わせている。
+    """
+    backend = FACTOR_BACKEND
+    use_flint = _HAS_FLINT and backend in ("auto", "flint")
+    # flint は項数の上限をずっと緩く取れる。sympy に落ちる場合に備えて
+    # 従来の上限も見るので、ここでは「どちらでも無理」な場合だけ弾く。
+    limit = _MAX_TERMS_FLINT if use_flint else max_terms
     try:
         pe = sp.Poly(expr)
-        if len(pe.monoms()) > max_terms:
+        if len(pe.monoms()) > limit:
             return None
     except Exception:
         pass
     key = sp.srepr(expr)
     if key in _FACTOR_CACHE:
         return _FACTOR_CACHE[key]
-    try:
-        r = sp.factor_list(expr)
-    except Exception:
-        r = None
+    r = None
+    if use_flint:
+        r = _flint_factor_list(expr)
+    if r is None and backend != "flint":
+        try:
+            n_terms = len(sp.Poly(expr).monoms())
+        except Exception:
+            n_terms = 0            # Poly に落ちない式は従来どおり素通し
+        if n_terms <= max_terms:
+            try:
+                r = sp.factor_list(expr)
+            except Exception:
+                r = None
     if len(_FACTOR_CACHE) > 4000:
         _FACTOR_CACHE.clear()
     _FACTOR_CACHE[key] = r
@@ -1087,7 +1241,6 @@ def resolve_singularities(
     newton_fast_max_vars: int = 24,
     product_split: bool = True,
     lower_bound=None,
-    upper_bound=None,
     use_cache: bool = True,
     verbose: bool = False,
 ) -> Resolution:
@@ -1273,10 +1426,6 @@ def resolve_singularities(
     lb_global = (sp.nsimplify(lower_bound) if lower_bound is not None else None)
     lb_stopped = False
     bound = float("inf")      # 大域 lambda の上界 (LP 上界 or 到達値)
-    if upper_bound is not None:
-        # 外から与えた健全な上界 (lc_filter の U1 など)。枝刈りは LB > bound の
-        # ときだけなので、真値 = upper_bound でも最小を与える chart は刈られない。
-        bound = float(upper_bound)
     achieved = float("inf")   # 実際に解消済み chart が到達した最小値
     ties_pruned = False
     prune_ties = (prune == "ties")

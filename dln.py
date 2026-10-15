@@ -1,5 +1,5 @@
 r"""
-Exact Algebraic Computation of Learning Coefficients for Two-Dimensional Singular Modelsbench/dln.py — **深層線形網の厳密な λ と θ** (Aoyagi の閉形式)
+bench/dln.py — **深層線形網の厳密な λ と θ** (Aoyagi の閉形式)
 
 M. Aoyagi, *Consideration on the learning efficiency of multiple-layered
 neural networks with linear units*, Neural Networks **172**:106132 (2024).
@@ -76,129 +76,26 @@ import sympy as sp
 __all__ = ["lambda_dln", "dln_cases", "self_check", "ShatInfo"]
 
 
-class ShatInfo(tuple):
-    """(Shat, ell, a, Mbar, degenerate) を名前つきで持つだけの入れ物。"""
+# 公式の実装そのものは **ライブラリ側 (dln_oracle.py)** に一本化した。
+# bench 側は従来の API をそのまま再公開するだけにして、式が 2 箇所に
+# 分かれないようにしている。
+import os as _os
+import sys as _sys
 
-    @property
-    def shat(self):
-        return self[0]
+# dln_oracle は、フラット構成では同じディレクトリ、bench/ 構成では親に居る。
+# どちらでも読めるように両方を通す。
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+for _p in (_HERE, _os.path.dirname(_HERE)):
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)
 
-    @property
-    def ell(self):
-        return self[1]
-
-    @property
-    def a(self):
-        return self[2]
-
-    @property
-    def mbar(self):
-        return self[3]
-
-    @property
-    def degenerate(self):
-        return self[4]
-
-
-def _find_shat(M: Sequence[int]) -> ShatInfo:
-    r"""条件 (i)–(iii) を満たす Ŝ を求める。
-
-    (i) より Ŝ は M を昇順に並べたときの**同値類まで含んだ先頭部分**に限る
-    (同じ値の s を一部だけ入れると M^(S_j) < M^(s) が strict にならない)。
-    その候補を小さい順に試し、(ii) と (iii) を満たすものを返す。
-    """
-    n = len(M)
-    idx = sorted(range(n), key=lambda i: M[i])
-    zeros = [i for i in range(n) if M[i] == 0]
-
-    # --- Remark 1: M^(s) = 0 が 1 個以上ある場合 ---
-    if len(zeros) > 1:
-        return ShatInfo((tuple(sorted(zeros)), len(zeros) - 1, None, None,
-                         True))
-    if len(zeros) == 1:
-        pos = [M[i] for i in range(n) if M[i] > 0]
-        if not pos:
-            return ShatInfo((tuple(zeros), 0, None, None, True))
-        mn = min(pos)
-        S = tuple(sorted(zeros + [i for i in range(n) if M[i] == mn]))
-        return ShatInfo((S, len(S) - 1, None, None, True))
-
-    # --- 一般の場合 ---
-    for k in range(2, n + 1):
-        S = tuple(sorted(idx[:k]))
-        out = [i for i in idx[k:]]
-        # (i) 同値類の切れ目でなければ候補にならない
-        if out and M[idx[k - 1]] >= M[idx[k]]:
-            continue
-        ell = k - 1
-        tot = sum(M[i] for i in S)
-        if any(tot < ell * M[i] for i in S):
-            continue
-        if any(tot >= ell * M[i] for i in out):
-            continue
-        # M̄ − 1 < tot/ℓ ≤ M̄
-        mbar = int(sp.ceiling(sp.Rational(tot, ell)))
-        a = tot - (mbar - 1) * ell
-        return ShatInfo((S, ell, a, mbar, False))
-    raise ValueError(f"Ŝ が見つかりません: M = {list(M)}")
-
-
-def lambda_dln(H: Sequence[int], r: int, *, info: bool = False):
-    r"""深層線形網の (λ, θ)。H = (H^(1), H^(2), …, H^(L+1))、r は真の階数。
-
-    H^(1) が出力ユニット数、H^(L+1) が入力ユニット数、間が隠れ層。
-    L = len(H) − 1 が重み行列の枚数。
-
-    返り値は (λ, θ)。`info=True` なら (λ, θ, ShatInfo) を返す。
-    """
-    H = [int(h) for h in H]
-    if len(H) < 3:
-        raise ValueError("H は少なくとも 3 つ (L ≥ 2) 必要です")
-    r = int(r)
-    if r < 0 or r > min(H):
-        raise ValueError(f"階数 r={r} が H={H} と整合しません")
-    M = [h - r for h in H]
-    si = _find_shat(M)
-    base = (-sp.Rational(r ** 2, 2)
-            + sp.Rational(r * (H[0] + H[-1]), 2))
-    if si.degenerate:
-        lam, th = base, 1
-    else:
-        S, ell, a = si.shat, si.ell, si.a
-        tot = sum(M[i] for i in S)
-        lam = (base
-               + sp.Rational(a * (ell - a), 4 * ell)
-               - sp.Rational(ell * (ell - 1), 4) * sp.Rational(tot, ell) ** 2
-               + sp.Rational(1, 2) * sum(M[i] * M[j]
-                                         for i, j in itertools.combinations(S, 2)))
-        th = a * (ell - a) + 1
-    lam = sp.nsimplify(lam)
-    return (lam, th, si) if info else (lam, th)
+from dln_oracle import (ShatInfo, _find_shat, _theorem2,   # noqa: E402,F401
+                        lambda_dln)
 
 
 # ----------------------------------------------------------------------
 # Theorem 2 (L = 2, 縮約ランク回帰) — 独立な経路
 # ----------------------------------------------------------------------
-def _theorem2(H1: int, H2: int, H3: int, r: int):
-    """Theorem 2 の場合分け。`lambda_dln` の検算にだけ使う。
-
-    case 3,4,5 は λ が閉じた式で与えられているので直接比べられる。
-    case 1,2 は λ が与えられていないので (ℓ, a, θ) だけ比べる。
-    """
-    if H1 + H2 < H3 + r:
-        return dict(case=3, ell=1, a=1, theta=1,
-                    lam=sp.Rational(H2 * H1 - H2 * r + H3 * r, 2))
-    if H2 + H3 < H1 + r:
-        return dict(case=4, ell=1, a=1, theta=1,
-                    lam=sp.Rational(H2 * H3 - H2 * r + H1 * r, 2))
-    if H1 + H3 < H2 + r:
-        return dict(case=5, ell=1, a=1, theta=1,
-                    lam=sp.Rational(H1 * H3, 2))
-    if (H1 + H2 + H3 + r) % 2 == 0:
-        return dict(case=1, ell=2, a=2, theta=1, lam=None)
-    return dict(case=2, ell=2, a=1, theta=2, lam=None)
-
-
 def self_check(verbose: bool = True) -> List[Tuple[str, bool, str]]:
     r"""公式の実装を独立な経路と突き合わせる。
 

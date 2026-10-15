@@ -828,6 +828,54 @@ classification at depth 2).
 Every value is a subspace restriction (first convolution only), hence a **lower
 bound** on the full λ.
 
+### 4.6.12 `dln_oracle.py` — a deep linear network oracle that skips resolution
+
+Aoyagi's closed form (Neural Networks 172:106132, Thm 1) now lives here, with
+`bench/dln.py` re-exporting it. On top of that, a route wired into
+`nn_rlct.local_rlct_from_ideal` returns λ and θ with **no resolution at all**,
+but **only when the ideal has been confirmed to be a DLN ideal**. It is on by
+default; `dln_oracle=False` turns it off.
+
+```python
+res = local_rlct_from_ideal(gens, V)                        # auto-detect (r=0)
+res = local_rlct_from_ideal(gens, V, dln_hint=((2,2,2), 1))  # declare (H, r)
+res.core_route        # 'dln' when the closed form was used
+```
+
+| H | r | vars | truth | oracle | resolution | speedup |
+|---|---|---|---|---|---|---|
+| (2,1,2) | 0 | 4 | λ=1, θ=2 | 0.9 ms | 0.06 s (wrong m) | 70x |
+| (2,2,1) | 0 | 6 | λ=1, θ=2 | 0.9 ms | 0.63 s (wrong m) | 676x |
+| (3,1,3) | 0 | 6 | λ=3/2, θ=2 | 2.7 ms | 0.85 s (wrong m) | 319x |
+| (2,2,2) | 0 | 8 | λ=3/2, θ=1 | 2.6 ms | 13.64 s (**wrong λ**) | 5326x |
+
+It is not only faster: it **corrects four values the resolution path got
+wrong** (three multiplicities, one λ — see §6.6).
+
+#### Soundness by construction — detect → reconstruct → compare
+
+The closed form depends entirely on the input really being a DLN ideal; applied
+to a similar-looking ideal it would silently return a wrong λ. So:
+
+1. **detect** — guess `(H, r)` and the variable-to-matrix-entry map from the
+   shape of the generators. This may fail freely; failing just falls through to
+   ordinary resolution.
+2. **reconstruct** — rebuild the DLN ideal from the guessed `(H, r)`.
+3. **compare** — require the rebuilt ideal to match the input **exactly**.
+
+Nothing that fails step 3 is ever reported as `proved`, so **a wrong λ from a
+false positive is structurally impossible**; the only failure mode is missing a
+detection, which merely costs time. `dln_oracle_tests` checks that six
+non-DLN families (extra linear term, non-multilinear, no consistent grid,
+regular, not a matrix product) do not fire, and that declaring `r = 1` for an
+`r = 0` ideal is rejected.
+
+Detection range, stated honestly: `r = 0` with `L = 2, 3` is detected from the
+generator structure alone (variable names are not consulted); the constructor's
+naming convention `A{s}_{i}_{j}` is used as a *hint* for any `L`; `L ≥ 4` or
+`r > 0` requires a `dln_hint=(H, r)` declaration, which is itself verified by
+steps 2–3.
+
 ### 4.7 `torch_rlct.py` — importing PyTorch models
 
 ```python
@@ -1160,6 +1208,32 @@ runs only once, as preprocessing in `nn_rlct`; it needs to run at every node.
 `known_issues()` in `guards.py` reports this mismatch on every run (outside
 the green gate). Once fixed it turns OK and should be promoted to a normal
 guard.
+
+## 6.6 Known unfixed bug: the multiplicity m can be under-reported
+
+Found by cross-checking against the DLN closed form. There are cases where
+**λ is right but θ collapses to 1** (all with r = 0):
+
+| H | true λ | true θ | general path m | route |
+|---|---|---|---|---|
+| (2,1,2) | 1 | 2 | **1** | newton |
+| (2,2,1) | 1 | 2 | **1** | resolve |
+| (3,1,3) | 3/2 | 2 | **1** | newton |
+
+The cause is that **charts attaining the minimum are not counted**. When the
+multiplicity arises inside a single chart (⟨ab⟩ for `H=(1,1,1)` gives m=2) it
+is reported correctly, so only the across-charts case is missed.
+
+λ is unaffected. θ is the coefficient of the `log log n` term, so **this bug
+does not change any result whose purpose is comparing λ**.
+
+**For DLNs this is resolved by the oracle in §4.6.12**, which returns the
+closed form's θ; what remains is the under-report on general families.
+
+> **Note the asymmetry between λ and m.** λ is protected by `certify`'s
+> proved/refuted certificate; **m has no certificate**. So m is one notch less
+> trustworthy than λ, and a paper should claim m only for families where the
+> closed form is known.
 
 ## 7. Known limitations
 

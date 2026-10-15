@@ -588,6 +588,73 @@ def newton_multiplicity(f, gens, h=None, *, max_facets: int = 14):
     return int(sp.Matrix(active).rank())
 
 
+_GROEBNER_MAX_VARS = 8
+_GROEBNER_MAX_TERMS = 200
+_GROEBNER_MAX_DEG = 12
+
+
+def _groebner_no_torus_zero(grads, gens):
+    """grad f_sigma = 0 が **複素**トーラス (全ての x_i != 0) 上に解を持たない
+    ことを Groebner 基底で示す。示せたら True、それ以外は None。
+
+    Rabinowitsch のトリック: 新変数 t を足して
+
+        I = <grad f_sigma> + <1 - t * prod x_i>   in  Q[x, t]
+
+    を作る。トーラス上の零点は I の零点と 1 対 1 に対応するので、
+    I = (1) (Groebner 基底が [1]) ならトーラス上に複素零点はない。
+
+    **健全性の向きが片方だけ**であることが肝心。
+
+      * GB = [1] なら複素零点がない。実零点は複素零点なので実トーラス上にも
+        零点はなく、この面は (実数体上) 非退化 -> 'proved' に使える。
+      * GB != [1] は「複素零点がある」だけで、それが実とは限らない。
+        RLCT に必要なのは実数体上の非退化性なので、この向きからは何も
+        言えない。よって False は返さず None を返して z3 に渡す。
+
+    この関数が 'refuted' を出すことは構造上ありえない。
+    """
+    gens = tuple(gens)
+    # まず単項式チェック: 勾配のどれかが単項式ならトーラス上で消えない。
+    # Groebner を組むより桁違いに安く、面の多くはこれで片付く。
+    for g in grads:
+        if g == 0:
+            continue
+        try:
+            pg = sp.Poly(g, *gens)
+        except Exception:
+            continue
+        if len(pg.monoms()) == 1 and pg.coeffs()[0] != 0:
+            return True
+    if len(gens) > _GROEBNER_MAX_VARS:
+        return None
+    polys = []
+    total = 0
+    for g in grads:
+        if g == 0:
+            continue
+        try:
+            pg = sp.Poly(g, *gens)
+        except Exception:
+            return None
+        if pg.total_degree() > _GROEBNER_MAX_DEG:
+            return None
+        total += len(pg.monoms())
+        polys.append(g)
+    if not polys or total > _GROEBNER_MAX_TERMS:
+        return None
+    t = sp.Dummy("t_rab")
+    try:
+        gb = sp.groebner(polys + [1 - t * sp.prod(gens)], *gens, t,
+                         order="grevlex")
+    except Exception:
+        return None
+    exprs = list(gb.exprs)
+    if len(exprs) == 1 and exprs[0].is_number and exprs[0] != 0:
+        return True
+    return None
+
+
 def newton_nondegenerate(f, gens, *, timeout_ms: int = 10000,
                          max_facets: int = 12):
     """f が (実数体上) ニュートン多面体に関して非退化かを判定する。
@@ -607,25 +674,35 @@ def newton_nondegenerate(f, gens, *, timeout_ms: int = 10000,
     faces = newton_faces(p.monoms(), max_facets)
     if faces is None:
         return ("unknown", None)
-    if not _HAS_Z3:
-        return ("unknown", None)
     coeff = {tuple(m): c for m, c in zip(p.monoms(), p.coeffs())}
+    # z3 の Solver は面ごとに作り直さず、push/pop で使い回す (起動コスト)。
+    s = _z3.Solver() if _HAS_Z3 else None
+    if s is not None:
+        s.set("timeout", timeout_ms)
+        zvars = {v: _z3.Real(f"t{i}") for i, v in enumerate(gens)}
     for face in faces:
         if len(face) < 2:
             continue                       # 単項式の面は自動的に非退化
         fs = sum(coeff[m] * sp.prod([v ** e for v, e in zip(gens, m)])
                  for m in face)
-        zvars = {v: _z3.Real(f"t{i}") for i, v in enumerate(gens)}
-        s = _z3.Solver()
-        s.set("timeout", timeout_ms)
+        grads = [sp.expand(sp.diff(fs, v)) for v in gens]
+        # 先に Gröbner で「複素トーラス上に零点なし」を試す。通れば
+        # 実トーラス上にも零点はないのでこの面は非退化 (z3 を呼ばない)。
+        if _groebner_no_torus_zero(grads, gens) is True:
+            continue
+        if s is None:
+            return ("unknown", face)
+        s.push()
         try:
             for v in gens:
                 s.add(zvars[v] != 0)
-            for v in gens:
-                s.add(_to_z3(sp.expand(sp.diff(fs, v)), zvars) == 0)
+            for g in grads:
+                s.add(_to_z3(g, zvars) == 0)
         except ValueError:
+            s.pop()
             return ("unknown", face)
         r = s.check()
+        s.pop()
         if r == _z3.sat:
             return ("refuted", face)
         if r != _z3.unsat:
@@ -1247,26 +1324,6 @@ def rlct_interval(f, gens=None, *, timeout_ms: int = 20000,
     except Exception:
         pass
 
-    # --- lc_filter: 健全な上下界 (ブローアップなし) ---------------------
-    gs_lc = generators if generators is not None else _sum_of_squares(f, gens)
-    if gs_lc:
-        try:
-            from lc_filter import lc_bounds
-            lcb = lc_bounds(gs_lc, gens)
-            if lcb.lo > lo:
-                lo = lcb.lo
-                src["lc_filter 下界"] = "; ".join(v for k, v in lcb.sources.items()
-                                                 if k.startswith("L"))
-            if lcb.hi is not None and lcb.hi < hi:
-                hi = lcb.hi
-                src["lc_filter 上界"] = lcb.sources.get("U1 有理点", "")
-            notes.extend(f"lc_filter: {x}" for x in lcb.notes)
-        except Exception as e:                        # noqa: BLE001
-            notes.append(f"lc_filter 失敗 ({str(e)[:60]})")
-        if lo == hi:
-            return RLCTInterval(lo, hi, "exact", lo, src,
-                                notes + ["lc_filter の上下界が一致 (解消は不要)。"])
-
     if ideal:
         gs = generators if generators is not None else _sum_of_squares(f, gens)
         if gs:
@@ -1461,23 +1518,6 @@ def _rlct_certified_inner(f, gens, *, timeout_ms, max_depth, verbose,
 
     gs = generators if generators is not None else _sum_of_squares(f, gens)
 
-    # --- lc_filter: 健全な上下界。一致すればブローアップ不要 -----------
-    lc_hi = None
-    if gs:
-        try:
-            from lc_filter import lc_bounds
-            with _timed("lc_filter"):
-                lcb = lc_bounds(gs, gens)
-            if lcb.exact is not None:
-                if verbose:
-                    print(f"  lc_filter: {lcb.sources} -> lambda = {lcb.exact}")
-                # m は決まらない (squeeze と同じ扱い)
-                return (lcb.exact, "proved", "lc_filter(rank/局所所属 + Singular bfct)")
-            lc_hi = lcb.hi
-            kw.setdefault("upper_bound", lc_hi)
-        except Exception:
-            lc_hi = None
-
     # --- イデアルを運ぶ経路 (既定で有効) -----------------------------
     lam_ideal = None
     if ideal:
@@ -1541,10 +1581,6 @@ def _rlct_certified_inner(f, gens, *, timeout_ms, max_depth, verbose,
         _LAST_CANDIDATES.extend(getattr(res, "cache_candidates", []))
     lam_poly = res.rlct
 
-    if lc_hi is not None and lam_poly is not sp.oo and lam_poly > lc_hi:
-        # 解消の値が lc_filter の健全な上界を超えている: 解消側の誤り
-        return (lc_hi, "unknown",
-                f"lc_filter 上界 {lc_hi} < 解消の値 {lam_poly} (解消側の誤り; 証明書 {cert.status})")
     if lam_ideal is not None and lam_ideal < lam_poly:
         # 小さいほうが真値に近い (どちらも上界)。ただし証明書は付かない。
         return (lam_ideal, "unknown", "ideal (多項式版より小さい値)")

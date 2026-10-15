@@ -327,6 +327,24 @@ def known_issues() -> List[GuardResult]:
         **重要**: これらは `certify` が status='refuted' を返すので、
         誤った値が proved として出ることはない。その検査は
         `vandermonde_never_proved_wrong_tests` にある。
+
+    (2) **位数 m を過小評価する場合がある。** 深層線形網の閉形式
+        (Aoyagi Thm 1) と突き合わせると、λ は合うのに θ が 1 に落ちる
+        例がある。実測 (いずれも r=0、λ は一致):
+
+            H=(2,1,2)  真値 λ=1   θ=2   一般経路 m=1  (newton)
+            H=(2,2,1)  真値 λ=1   θ=2   一般経路 m=1  (resolve)
+            H=(3,1,3)  真値 λ=3/2 θ=2   一般経路 m=1  (newton)
+
+        原因は、最小値を達成する chart が複数あるときにその本数を
+        数え上げていないこと (H=(1,1,1) の ⟨ab⟩ のように 1 つの chart の
+        中で重複度が出る場合は正しく m=2 を返す)。λ には影響しない。
+        **DLN については `dln_oracle` が閉形式の θ を返すので解決済み**で、
+        残っているのは一般の族での過小評価。θ は自由エネルギーの
+        log log n 項の係数に効くので、λ の比較には影響しない。
+
+        ここは λ ほど危険ではない (λ は proved/refuted の証明書で守られて
+        いるが、m には証明書がない) ことを明記しておく。
     """
     from resolve_singularity import resolve_singularities
     out: List[GuardResult] = []
@@ -352,6 +370,419 @@ def known_issues() -> List[GuardResult]:
             out.append(GuardResult(
                 f"[既知] Vandermonde M={M} H={H} Q={Q} の多項式経路", False,
                 f"評価できません: {str(e)[:40]}"))
+
+    # (2) 位数の過小評価 (DLN の閉形式と突き合わせる)
+    try:
+        import dln_oracle as DO
+        from nn_rlct import local_rlct_from_ideal
+    except Exception:                                    # noqa: BLE001
+        return out
+    for H, r in (((2, 1, 2), 0), ((2, 2, 1), 0), ((3, 1, 3), 0)):
+        gens, V = DO._build_ideal(H, r)
+        lam_t, th_t = DO.lambda_dln(H, r)
+        try:
+            g = local_rlct_from_ideal(gens, V, dln_oracle=False, max_depth=8)
+            detail = (f"λ {g.rlct} (真値 {lam_t}) / "
+                      f"m {g.multiplicity} (真値 {th_t}, route={g.core_route})")
+            out.append(GuardResult(
+                f"[既知] 位数の過小評価 DLN H={H} r={r}",
+                g.multiplicity == th_t and g.rlct == lam_t,
+                detail + ("" if g.multiplicity == th_t
+                          else "  <- 未修正 (λ は一致。オラクル経路では解決)")))
+        except Exception as e:                           # noqa: BLE001
+            out.append(GuardResult(
+                f"[既知] 位数の過小評価 DLN H={H} r={r}", False,
+                f"評価できません: {str(e)[:40]}"))
+    return out
+
+
+def lc_filter_tests() -> List[GuardResult]:
+    r"""**lc_filter の上下界が健全か** と、RRR で上界が締まるか。
+
+    上界 U1 (θ\* でのヤコビアンの階数 r と商イデアルの (S) 判定 ⇒ λ ≤ r/2) と
+    下界 L2 (b 関数から `lct_C(I)/2`、`λ_R ≥ lct_C` を使う) の挟み込み。
+    検査するのは `lo ≤ 真値 ≤ hi` という**健全性**で、締まり具合ではない。
+
+    真値: 平易な例は手計算 / 既知、RRR (縮約ランク回帰) は
+    Aoyagi–Watanabe (2005)。
+
+    さらに `nn_rlct` が lc_filter の上界を超える値を返さないこと
+    ((2,2,2,0) で以前は λ=2 を黙って返していた。真値 3/2)。
+
+    `lc_filter.py` が無い環境では**スキップとして明示的に報告**する
+    (そちらの版は未保護の import で `run_all` 全体が落ちていた)。
+    """
+    sys.path[:0] = ["."]
+    try:
+        from lc_filter import lc_bounds, rrr_problem
+    except ImportError:
+        return [GuardResult(
+            "lc_filter", True,
+            "スキップ: lc_filter.py が見つかりません (この検査は走っていません)")]
+    out: List[GuardResult] = []
+    x, y, z = sp.symbols("x y z", real=True)
+    simple = [("cusp (x^2+y^3)", [x**2 + y**3], [x, y], sp.Rational(5, 12)),
+              ("A2 曲面", [x**2 + y**3 + z**2], [x, y, z], sp.Rational(1, 2)),
+              ("x^2+y^2+z^2 (実点が孤立)", [x**2 + y**2 + z**2], [x, y, z],
+               sp.Rational(3, 4)),
+              ("(xy, z)", [x * y, z], [x, y, z], sp.Integer(1))]
+    for name, g, X, lam0 in simple:
+        try:
+            b = lc_bounds(g, X)
+        except Exception as e:                        # noqa: BLE001
+            out.append(GuardResult(f"lc_filter 健全 {name}", False,
+                                   f"例外 {type(e).__name__}: {str(e)[:40]}"))
+            continue
+        ok = b.lo <= lam0 and (b.hi is None or lam0 <= b.hi)
+        out.append(GuardResult(f"lc_filter 健全 {name}", ok,
+                               f"[{b.lo}, {b.hi}] 真値 {lam0}"))
+    for case in [(1, 1, 1, 0), (2, 1, 1, 0), (2, 2, 1, 0), (3, 3, 1, 0),
+                 (2, 2, 2, 0)]:
+        try:
+            gens, X, _wit, (lam0, _m) = rrr_problem(*case)
+            b = lc_bounds(gens, X)            # witness なし (探索だけ)
+        except Exception as e:                        # noqa: BLE001
+            out.append(GuardResult(f"lc_filter RRR {case}", False,
+                                   f"例外 {type(e).__name__}: {str(e)[:40]}"))
+            continue
+        ok = b.lo <= lam0 and b.hi is not None and b.hi == lam0
+        out.append(GuardResult(
+            f"lc_filter RRR {case}", ok,
+            f"[{b.lo}, {b.hi}] 真値 {lam0} (上界 = c/2 = 真値 を期待)"))
+    try:
+        from nn_rlct import local_rlct_from_ideal
+        gens, X, _w, (lam0, _m) = rrr_problem(2, 2, 2, 0)
+        r = local_rlct_from_ideal(gens, X)
+        out.append(GuardResult("nn_rlct RRR (2,2,2,0) が上界を超えない",
+                               r.rlct <= lam0,
+                               f"lambda={r.rlct} 真値 {lam0} "
+                               f"(route={r.core_route})"))
+    except Exception as e:                            # noqa: BLE001
+        out.append(GuardResult("nn_rlct RRR (2,2,2,0)", False, f"例外 {e}"))
+    return out
+
+
+def flint_factor_tests() -> List[GuardResult]:
+    r"""**flint による因数分解が sympy と一致するか** (`resolve_singularity`)。
+
+    因数分解は等式変形なので「片側だけ健全」という話はなく、間違えれば
+    ただ誤る。だから遅い sympy を参照実装として残し、コーパス全体で
+    突き合わせる。見るのは
+
+      (1) 因子の積が元の多項式に戻るか (自己完結した検査)
+      (2) 因子の**集合**と定数が sympy と一致するか (並び順は問わない)
+      (3) 定数・ゼロ・有理係数・非可換でない生成元などの端の場合
+      (4) 扱えない入力で例外を投げず None に倒れるか
+
+    flint が入っていない環境では (2) を飛ばす。
+    """
+    import random
+
+    import resolve_singularity as RS
+    out: List[GuardResult] = []
+    V = sp.symbols("g0:5", real=True)
+    cases = [
+        V[0] ** 2 + V[1] ** 2,
+        (V[0] ** 2 + V[1]) * (V[0] + V[2] ** 2),
+        sp.expand((V[0] * V[1] - V[2] ** 2) ** 2 * (V[3] + V[4])),
+        sp.expand((2 * V[0] + 1) * (3 * V[1] + 1)),
+        -V[0] - 1,
+        sp.expand((V[0] + V[1] + V[2]) ** 3),
+        sp.Integer(7),
+        sp.Rational(-1, 3),
+        sp.expand(sum(v ** 3 for v in V) + sp.prod(V)),
+        sp.Rational(1, 3) * V[0] ** 2 + sp.Rational(2, 5) * V[1],
+        sp.expand((V[0] ** 2 + V[1] ** 2) * (V[2] ** 2 + V[3] ** 2)),
+    ]
+    random.seed(20251012)
+    for _ in range(60):
+        e = sum(sp.Rational(random.randint(-9, 9), random.randint(1, 7))
+                * sp.prod([v ** random.randint(0, 3) for v in V])
+                for _ in range(5))
+        cases.append(sp.expand(e))
+
+    n_prod = n_cmp = 0
+    bad_prod: List[str] = []
+    bad_cmp: List[str] = []
+    for e in cases:
+        for backend in ("flint", "sympy"):
+            if backend == "flint" and not RS._HAS_FLINT:
+                continue
+            RS._FACTOR_CACHE.clear()
+            RS.FACTOR_BACKEND = backend
+            try:
+                r = RS._cached_factor_list(e)
+            finally:
+                RS.FACTOR_BACKEND = "auto"
+                RS._FACTOR_CACHE.clear()
+            if r is None:
+                continue
+            n_prod += 1
+            prod = r[0] * sp.prod([g ** m for g, m in r[1]])
+            if sp.expand(prod - e) != 0:
+                bad_prod.append(f"{backend}: {e}")
+        if not RS._HAS_FLINT:
+            continue
+        RS._FACTOR_CACHE.clear()
+        RS.FACTOR_BACKEND = "flint"
+        a = RS._cached_factor_list(e)
+        RS._FACTOR_CACHE.clear()
+        RS.FACTOR_BACKEND = "sympy"
+        b = RS._cached_factor_list(e)
+        RS.FACTOR_BACKEND = "auto"
+        RS._FACTOR_CACHE.clear()
+        if a is None or b is None:
+            if (a is None) != (b is None):
+                bad_cmp.append(f"片方だけ None: {e}")
+            continue
+        n_cmp += 1
+        sa = sorted((sp.srepr(sp.expand(g)), m) for g, m in a[1])
+        sb = sorted((sp.srepr(sp.expand(g)), m) for g, m in b[1])
+        if sa != sb or sp.nsimplify(a[0]) != sp.nsimplify(b[0]):
+            bad_cmp.append(f"{e}: flint {a} 対 sympy {b}")
+
+    out.append(GuardResult(
+        "因数分解: 因子の積が元に戻る", not bad_prod,
+        f"{n_prod} 件" + ("" if not bad_prod else f" / NG {bad_prod[:2]}")))
+    out.append(GuardResult(
+        "因数分解: flint と sympy が一致", not bad_cmp,
+        f"{n_cmp} 件 突き合わせ" if RS._HAS_FLINT else "flint 未導入のため省略"
+        + ("" if not bad_cmp else f" / NG {bad_cmp[:2]}")))
+
+    # 扱えない入力で落ちないこと
+    t = sp.Symbol("t", real=True)
+    robust = True
+    for e in (sp.sin(t), sp.Integer(0), sp.sqrt(2) * t, t ** sp.Rational(1, 2)):
+        try:
+            RS._FACTOR_CACHE.clear()
+            RS._flint_factor_list(e)
+            RS._cached_factor_list(e)
+        except Exception:                                 # noqa: BLE001
+            robust = False
+    RS._FACTOR_CACHE.clear()
+    out.append(GuardResult("因数分解: 扱えない入力でも例外を出さない", robust))
+    return out
+
+
+def groebner_filter_tests() -> List[GuardResult]:
+    r"""**Groebner 非退化フィルタの健全性の向き** (`certify`)。
+
+    このフィルタは Rabinowitsch のトリックで「**複素**トーラス上に
+    grad f_sigma = 0 の解がない」ことを示す。健全なのは片方向だけ:
+
+      * 示せた -> 実トーラス上にも解がない -> 非退化 ('proved' に使える)
+      * 示せない -> 複素解はあるかもしれないが実解とは限らない -> 何も
+        言えない。だから **False を返してはならない** (None に倒して z3 へ)。
+
+    検査するのは
+
+      (1) トーラス上に零点がない系で True を返す
+      (2) **複素零点はあるが実零点はない**系で True を返さない
+          (x^2+y^2 = 0 はトーラス上に複素解 x = ±iy を持つ)
+      (3) 本当に退化している系で True を返さない
+      (4) フィルタを入れても `newton_nondegenerate` の答えが変わらない
+          (フィルタ有/無で全コーパスを突き合わせる)
+    """
+    import certify as C
+    out: List[GuardResult] = []
+    x, y, z = sp.symbols("x y z", real=True)
+
+    out.append(GuardResult(
+        "Groebner: トーラス上に零点なしを示せる",
+        C._groebner_no_torus_zero([x ** 2 + y ** 2, x - y], (x, y)) is True))
+    out.append(GuardResult(
+        "Groebner: 単項式は即 True",
+        C._groebner_no_torus_zero([x * y, x * y], (x, y)) is True))
+    # 複素零点はあるが実零点はない -> True を返してはいけない
+    ok_cx = C._groebner_no_torus_zero([x ** 2 + y ** 2], (x, y)) is not True
+    out.append(GuardResult(
+        "Groebner: 複素零点だけの系で True を返さない", ok_cx,
+        "x^2+y^2 はトーラス上に複素解を持つ"))
+    # 退化している系
+    ok_deg = C._groebner_no_torus_zero([2 * x + 2 * y, 2 * x + 2 * y],
+                                       (x, y)) is not True
+    out.append(GuardResult("Groebner: 退化した系で True を返さない", ok_deg))
+    # False は決して返さない
+    never_false = True
+    probes = [([x ** 2 + y ** 2], (x, y)), ([x + y], (x, y)),
+              ([x * y - 1], (x, y)), ([x ** 2 - y ** 2], (x, y)),
+              ([x ** 3 + y ** 3 + z ** 3], (x, y, z)), ([sp.Integer(0)], (x,))]
+    for g, V in probes:
+        if C._groebner_no_torus_zero(g, V) is False:
+            never_false = False
+    out.append(GuardResult("Groebner: False を返さない (構造的保証)",
+                           never_false))
+
+    # フィルタ有/無で newton_nondegenerate の答えが変わらないこと
+    corpus = [
+        (x ** 2 + y ** 2, (x, y)), (x ** 2 * y + x * y ** 2, (x, y)),
+        (x ** 3 + y ** 3 + z ** 3, (x, y, z)), ((x + y) ** 2, (x, y)),
+        (x ** 2 + y ** 4, (x, y)), (x ** 2 - y ** 2, (x, y)),
+        (x ** 2 + x * y + y ** 2, (x, y)),
+        (sp.expand((x + y) ** 2 + z ** 3), (x, y, z)),
+        (x ** 4 + y ** 4 + x ** 2 * y ** 2, (x, y)),
+        (sp.expand(x ** 2 * y ** 2 + x ** 3 + y ** 3), (x, y)),
+    ]
+    orig = C._groebner_no_torus_zero
+    diffs: List[str] = []
+    try:
+        for f, V in corpus:
+            with_f = C.newton_nondegenerate(f, V)[0]
+            C._groebner_no_torus_zero = lambda *a, **k: None
+            without = C.newton_nondegenerate(f, V)[0]
+            C._groebner_no_torus_zero = orig
+            if with_f != without:
+                diffs.append(f"{f}: フィルタ有 {with_f} / 無 {without}")
+    finally:
+        C._groebner_no_torus_zero = orig
+    out.append(GuardResult(
+        "Groebner: フィルタの有無で非退化判定が変わらない", not diffs,
+        f"{len(corpus)} 件" + ("" if not diffs else f" / {diffs[:2]}")))
+    return out
+
+
+def ilp_backend_tests() -> List[GuardResult]:
+    r"""**ILP/LP のバックエンドを替えても答えが変わらないか**。
+
+    CBC はサブプロセスを起動するので 1 回目に 585ms、以降 5.6ms かかる
+    (実測)。in-process の HiGHS は 2.7ms で立ち上がりもない。整数最適解
+    なので値は同じであるべきで、ここでそれを確かめる。
+
+    最小ヒッティング集合は**最適値 (大きさ) が一意**で解は一意でないので、
+    比べるのは大きさと「本当に全ての台を叩くか」。
+    """
+    import random
+
+    import resolve_singularity as RS
+    out: List[GuardResult] = []
+    random.seed(7)
+    bad: List[str] = []
+    n_cmp = 0
+    for trial in range(40):
+        n = random.randint(3, 9)
+        sets = []
+        for _ in range(random.randint(2, 12)):
+            k = random.randint(1, min(4, n))
+            sets.append(frozenset(random.sample(range(n), k)))
+        a = RS._ilp_min_hitting_set_scipy(sets, n)
+        b = RS._ilp_min_hitting_set(sets, n, backend="pulp") \
+            if RS._HAS_PULP else None
+        for nm, got in (("scipy", a), ("pulp", b)):
+            if got is None:
+                continue
+            if any(not (set(got) & set(S)) for S in sets):
+                bad.append(f"{nm} の解が台を叩いていない: {sets} -> {got}")
+        if a is not None and b is not None:
+            n_cmp += 1
+            if len(a) != len(b):
+                bad.append(f"大きさが違う: scipy {len(a)} / pulp {len(b)}")
+    out.append(GuardResult(
+        "ILP: scipy(HiGHS) と pulp(CBC) の最適値が一致", not bad,
+        f"{n_cmp} 件 突き合わせ" + ("" if not bad else f" / NG {bad[:2]}")))
+
+    # LP (ニュートン上界) もバックエンドで一致すること
+    diffs: List[str] = []
+    random.seed(11)
+    n_lp = 0
+    for _ in range(30):
+        n = random.randint(2, 4)
+        monoms = [tuple(random.randint(0, 4) for _ in range(n))
+                  for _ in range(random.randint(2, 6))]
+        if any(all(e == 0 for e in m) for m in monoms):
+            continue
+        hplus = [random.randint(1, 3) for _ in range(n)]
+        va = RS._lp_newton_value(monoms, hplus, backend="scipy")
+        if not RS._HAS_PULP:
+            continue
+        vb = RS._lp_newton_value(monoms, hplus, backend="pulp")
+        n_lp += 1
+        if not (va == vb or (va == float("inf") and vb == float("inf"))
+                or abs(va - vb) < 1e-7):
+            diffs.append(f"{monoms} h+={hplus}: scipy {va} / pulp {vb}")
+    out.append(GuardResult(
+        "LP: ニュートン上界がバックエンドで一致", not diffs,
+        f"{n_lp} 件 突き合わせ" + ("" if not diffs else f" / {diffs[:2]}")))
+
+    # pulp の版差吸収 (lowBound)
+    if RS._HAS_PULP:
+        try:
+            v = RS._lp_var("probe", low=0)
+            okv = v is not None and getattr(v, "lowBound", 0) == 0
+        except Exception as e:                            # noqa: BLE001
+            okv = False
+            v = str(e)[:40]
+        out.append(GuardResult("pulp: lowBound の版差を吸収できる", okv))
+    return out
+
+
+def dln_oracle_tests() -> List[GuardResult]:
+    r"""**深層線形網オラクルが誤検出しないか** (`dln_oracle`)。
+
+    閉形式は「入力が DLN のイデアルである」ことに全面的に依存する。
+    似て非なるイデアルに当てれば黙って誤った λ を返すので、オラクルは
+    detect -> reconstruct -> compare の順で、**組み直したイデアルが入力と
+    厳密に一致した場合だけ**発火する。ここで確かめるのは
+
+      (1) 本物の DLN で (H, r) を復元し、閉形式と一致した λ, θ を返す
+      (2) **DLN でないイデアルで発火しない** (誤検出がないこと)
+      (3) 構造が合っていても階数 r を偽った宣言は通らない
+      (4) オラクルを切っても切らなくても、**DLN でない**入力に対する
+          `local_rlct_from_ideal` の値が変わらない
+      (5) 公式自体の検算 (Aoyagi Theorem 2 との突き合わせ) が通る
+    """
+    sys.path[:0] = ["."]
+    out: List[GuardResult] = []
+    try:
+        import dln_oracle as DO
+        from nn_rlct import local_rlct_from_ideal
+    except Exception as e:                                # noqa: BLE001
+        return [GuardResult("DLN オラクル", False, f"読み込めません: {e}")]
+
+    # (5) + (1)(2)(3) は self_check が網羅している
+    bad = DO.self_check(verbose=False)
+    out.append(GuardResult(
+        "DLN オラクル: self_check (公式の検算 + 誤検出なし)", not bad,
+        "" if not bad else f"{len(bad)} 件 NG: {bad[:2]}"))
+
+    # (1) 閉形式との一致を経路ごと (構造検出 / 宣言) に確かめる
+    mism: List[str] = []
+    fired = 0
+    for H, r in [((1, 1, 1), 0), ((2, 1, 2), 0), ((1, 2, 1), 0),
+                 ((2, 2, 1), 0), ((2, 2, 2), 0), ((1, 1, 1, 1), 0),
+                 ((3, 1, 3), 0), ((2, 1, 2), 1), ((2, 2, 2), 1)]:
+        gens, V = DO._build_ideal(H, r)
+        truth = DO.lambda_dln(H, r)
+        res = local_rlct_from_ideal(gens, V, dln_oracle=True,
+                                    dln_hint=(H, r) if r else None)
+        if res.core_route != "dln":
+            mism.append(f"H={H} r={r}: オラクルが発火しなかった")
+            continue
+        fired += 1
+        if (res.rlct, res.multiplicity) != (truth[0], truth[1]):
+            mism.append(f"H={H} r={r}: {(res.rlct, res.multiplicity)} "
+                        f"!= {truth}")
+    out.append(GuardResult(
+        "DLN オラクル: 閉形式と λ, θ が一致", not mism,
+        f"{fired} 件発火" + ("" if not mism else f" / NG {mism[:2]}")))
+
+    # (4) DLN でない入力では、オラクルの有無で値が変わらない
+    x, y, z = sp.symbols("dx dy dz", real=True)
+    changed: List[str] = []
+    for gens, V, nm in [([x * y + x], (x, y), "xy+x"),
+                        ([x ** 2 + y ** 2], (x, y), "x^2+y^2"),
+                        ([x * y, x * z], (x, y, z), "xy,xz"),
+                        ([x + y], (x, y), "x+y"),
+                        ([x * y - z ** 2], (x, y, z), "xy-z^2")]:
+        a = local_rlct_from_ideal(gens, V, dln_oracle=True)
+        b = local_rlct_from_ideal(gens, V, dln_oracle=False)
+        if a.core_route == "dln":
+            changed.append(f"{nm}: DLN でないのに発火した")
+        elif (a.rlct, a.multiplicity) != (b.rlct, b.multiplicity):
+            changed.append(f"{nm}: {(a.rlct, a.multiplicity)} "
+                           f"!= {(b.rlct, b.multiplicity)}")
+    out.append(GuardResult(
+        "DLN オラクル: 非 DLN では発火せず値も変わらない", not changed,
+        "" if not changed else f"NG {changed[:2]}"))
     return out
 
 
@@ -1555,14 +1986,22 @@ def run_all(verbose: bool = True):
            + taylor_sweep_tests() + analytic_activation_tests()
            + cnn_depth_tests() + ideal_coordinate_invariance_tests()
            + vandermonde_never_proved_wrong_tests()
-           + dln_formula_tests() + resnet_tests())
+           + dln_formula_tests() + resnet_tests()
+           + flint_factor_tests() + groebner_filter_tests()
+           + ilp_backend_tests() + dln_oracle_tests()
+           + lc_filter_tests())
     if verbose:
         for r in res:
             print("  " + str(r))
     n_bad = sum(1 for r in res if not r.ok)
+    n_skip = sum(1 for r in res if r.ok and r.detail.startswith("スキップ"))
     known = known_issues()
     if verbose:
-        print(f"  --> guards: {len(res) - n_bad}/{len(res)} 緑")
+        print(f"  --> guards: {len(res) - n_bad}/{len(res)} 緑"
+              + (f"  (うち {n_skip} 件はスキップ: 下に理由)" if n_skip else ""))
+        for r in res:
+            if r.ok and r.detail.startswith("スキップ"):
+                print(f"    [スキップ] {r.name}  {r.detail}")
         if known:
             print("  既知の未修正バグ (ゲートには数えない):")
             for k in known:

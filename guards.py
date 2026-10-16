@@ -408,6 +408,168 @@ def dln_trajectory_tests() -> List[GuardResult]:
 
 
 
+
+def nn_trajectory_tests() -> List[GuardResult]:
+    """`nn_trajectory.py` (ReLU/tanh/CNN/attention の軌道上の λ) の検査。
+
+    (1) linear: 各プラトーの代表点で 下界 ≤ Aoyagi の λ ≤ 上界、かつ上界 = Aoyagi
+        (深層線形網では λ = codim/2 が成り立つので数値上界は厳密値に一致するはず)
+    (2) 学生の初期値が呼び出し側の既定 dtype に依らない
+    (3) rationalize が構造 (0 の成分・クラスタの平行性・階数) を壊さない
+    (4) attention_ideal の生成元が原点で消え、torch の出力差と一致する
+    (5) CNN で解消が proved を返す点では 下界 ≤ 厳密 ≤ 上界
+    """
+    out: List[GuardResult] = []
+    try:
+        import torch
+    except Exception:                                    # noqa: BLE001
+        return out
+    import nn_trajectory as nt
+
+    # (1)
+    cfg = nt.config_for("linear")
+    X, y, _ = nt.make_task(cfg)
+    _, steps, states, losses = nt.train_checkpoints(cfg, X, y)
+    m = nt.make_student(cfg)
+    recs = []
+    for sd in states:
+        m.load_state_dict(sd)
+        ci = nt.classify(m, cfg)
+        recs.append(dict(k=ci.k, ambiguous=ci.ambiguous))
+    bad, seen = [], []
+    for j in nt.representatives(recs):
+        m.load_state_dict(states[j])
+        ci = nt.classify(m, cfg)
+        bar = nt.rationalize(nt.snap(m, cfg, ci), cfg, ci)
+        lo = nt.lower_bound(bar, X)
+        up = nt.upper_bound(bar, X).value
+        ex = nt.exact_lambda(bar, X, cfg, ci)["lam_f"]
+        seen.append((ci.k, lo, ex, up))
+        if not (lo <= ex + 1e-12 and abs(up - ex) < 1e-12):
+            bad.append((ci.k, lo, ex, up))
+    out.append(GuardResult(
+        "nn軌道: linear で 下界 ≤ Aoyagi = 数値上界",
+        bool(seen) and not bad,
+        f"(k, 下界, 厳密, 上界) = {seen}" + (f"  外れ {bad}" if bad else "")))
+
+    # (2)
+    c2 = nt.config_for("relu")
+    prev = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float32)
+        a = nt._param_vector(nt.make_student(c2))
+        torch.set_default_dtype(torch.float64)
+        b = nt._param_vector(nt.make_student(c2))
+    finally:
+        torch.set_default_dtype(prev)
+    out.append(GuardResult("nn軌道: 学生の初期値が既定 dtype に依らない",
+                           bool(torch.equal(a, b)), ""))
+
+    # (3)
+    ok3, det = True, []
+    for arch in ("relu", "cnn", "attn", "tanh"):
+        c3 = nt.config_for(arch)
+        st = nt.make_student(c3)
+        with torch.no_grad():
+            P = dict(st.named_parameters())
+            if arch == "relu":       # ユニット 0,1 を同じ向き、2 を別向き、残り 0
+                P["0.weight"][:, 0] = torch.tensor([1.3, 2.6, -0.7, 0, 0, 0])
+                P["0.bias"][:] = torch.tensor([0.39, 0.78 + 1e-4, 0.2, 0, 0, 0])
+                P["2.weight"][0] = torch.tensor([1.1, 0.4, 0.9, 0, 0, 0])
+            elif arch == "cnn":
+                P["0.weight"][0, 0, 0] = torch.tensor([0.6, 0.8])
+                P["0.weight"][1, 0, 0] = torch.tensor([1.2, 1.6 + 1e-4])
+                P["0.weight"][2, 0, 0] = torch.tensor([0.0, 0.0])
+                P["4.weight"][0] = torch.tensor([1.5, 0.7, 0.0])
+            elif arch == "attn":
+                for nm in ("q", "k", "v"):
+                    P[nm][0] = torch.tensor([0.6, 0.8])
+                    P[nm][1] = torch.tensor([-0.3, 0.9])
+                    P[nm][2] = torch.tensor([0.0, 0.0])
+                P["q"][2] = torch.tensor([1.2, 1.6 + 1e-4])
+                P["k"][2] = torch.tensor([0.6, 0.8])
+                P["v"][2] = torch.tensor([-0.6, -0.8 + 1e-4])
+            else:
+                P["0.weight"][:] = torch.randn(3, 3) @ torch.diag(
+                    torch.tensor([1.0, 1e-4, 0.0])) @ torch.randn(3, 3)
+                P["2.weight"][:] = torch.randn(3, 3)
+        ci = nt.classify(st, c3)
+        c3.teacher_strengths = (0.01,)
+        ci = nt.classify(st, c3)
+        bar = nt.rationalize(nt.snap(st, c3, ci), c3, ci)
+        Pb = dict(bar.named_parameters())
+        if arch in ("tanh",):
+            r = [int(torch.linalg.matrix_rank(Pb[n], rtol=1e-12))
+                 for n in ("0.weight", "2.weight")]
+            good = all(v == ci.k for v in r)
+            det.append(f"{arch}: k={ci.k} 層の階数 {r}")
+        else:
+            sig = nt._signatures(bar, c3)
+            good = True
+            for cl in ci.clusters:
+                for j in cl[1:]:
+                    for u, v in zip(sig[cl[0]], sig[j]):
+                        cs = abs(float(u @ v) / float(u.norm() * v.norm()))
+                        good &= cs > 1 - 1e-14
+            zeros = [j for j in range(len(sig)) if j not in ci.active]
+            for j in zeros:
+                good &= all(float(u.norm()) == 0 for u in sig[j])
+            det.append(f"{arch}: クラスタ {ci.clusters}")
+        ok3 &= good
+    out.append(GuardResult("nn軌道: rationalize が 0・平行・階数を保つ", ok3,
+                           "; ".join(det)))
+
+    # (4)
+    c4 = nt.config_for("attn", n_data=3)
+    X4, _, _ = nt.make_task(c4)
+    st = nt.make_student(c4)
+    with torch.no_grad():
+        for p in st.parameters():
+            p.copy_(torch.tensor([[float(nt._rat(v, 8)) for v in row]
+                                  for row in (torch.randn(p.shape)).tolist()]))
+    gens, variables, symv = nt.attention_ideal(st, X4)
+    at0 = all(sp.expand(g).subs({v: 0 for v in variables}) == 0 for g in gens)
+    delta = {v: sp.Rational(1, 1000) * (i % 3 - 1)
+             for i, v in enumerate(variables)}
+    pert = copy.deepcopy(st)
+    with torch.no_grad():
+        Pp = dict(pert.named_parameters())
+        for (v, dv) in delta.items():
+            nm, h, i = str(v)[1:].split("_")
+            Pp[nm][int(h), int(i)] += float(dv)
+    num = (pert(X4) - st(X4)).detach().reshape(-1)
+    sym_vals = [float(g.subs(delta)) for g in gens]
+    nz = [float(v) for v in num if abs(float(v)) > 0]
+    err = max(abs(a_ - b_) for a_, b_ in zip(sorted(sym_vals), sorted(nz))) \
+        if len(sym_vals) == len(nz) else float("inf")
+    out.append(GuardResult(
+        "nn軌道: attention_ideal が原点で消え torch の差分と一致",
+        at0 and err < 1e-6,
+        f"生成元 {len(gens)} 本、最大誤差 {err:.1e}、対称ベクトル {len(symv)} 本"))
+
+    # (5)
+    c5 = nt.config_for("cnn")
+    X5, _, _ = nt.make_task(c5)
+    st = nt.make_student(c5)
+    with torch.no_grad():
+        P = dict(st.named_parameters())
+        P["0.weight"][0, 0, 0] = torch.tensor([0.75, -0.5])
+        P["0.weight"][1, 0, 0] = torch.tensor([0.25, 1.0])
+        P["0.weight"][2, 0, 0] = torch.tensor([0.5, 2.0])
+        P["4.weight"][0] = torch.tensor([2.0, 1.5, 0.5])
+    c5.teacher_strengths = (0.01,)
+    ci = nt.classify(st, c5)
+    bar = nt.rationalize(nt.snap(st, c5, ci), c5, ci)
+    lo = nt.lower_bound(bar, X5)
+    up = nt.upper_bound(bar, X5).value
+    ex = nt.exact_lambda(bar, X5, c5, ci, timeout=60)
+    good = ex.get("status") == "proved" and lo <= ex["lam_f"] <= up
+    out.append(GuardResult(
+        "nn軌道: CNN の proved 値が括弧 [下界, 上界] に入る", good,
+        f"下界 {lo} / 厳密 {ex.get('lam')} ({ex.get('status')}) / 上界 {up}"))
+    return out
+
+
 def _dln_multiplicity_coordinate_issue() -> List[GuardResult]:
     """[既知] 解消経路 (`torch_local_rlct`) の (λ, m) が隠れ層の座標に依存する。
 
@@ -1704,7 +1866,7 @@ def run_all(verbose: bool = True):
            + cnn_depth_tests() + ideal_coordinate_invariance_tests()
            + vandermonde_never_proved_wrong_tests()
            + dln_formula_tests() + resnet_tests()
-           + dln_trajectory_tests())
+           + dln_trajectory_tests() + nn_trajectory_tests())
     if verbose:
         for r in res:
             print("  " + str(r))

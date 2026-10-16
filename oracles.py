@@ -14,8 +14,8 @@ from typing import Dict, List, Optional
 import sympy as sp
 
 from families import family_rlct
-from resolve_singularity import (ResolutionFailure, newton_rlct,
-                                 resolve_singularities)
+from resolve_singularity import ResolutionFailure, resolve_singularities
+from newton import newton_rlct
 
 
 def family_oracle(f, gens):

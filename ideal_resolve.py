@@ -46,7 +46,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import sympy as sp
 
-from resolve_singularity import (ResolutionFailure, _min_center, newton_rlct)
+from resolve_singularity import ResolutionFailure, _min_center
+from newton import newton_rlct
 
 __all__ = ["resolve_ideal", "IdealResolution"]
 
@@ -179,7 +180,7 @@ def _terminal_value(node: INode):
         return (sp.oo, 0)
     lam = newton_rlct(P, node.vars, h=list(node.h))
     try:
-        from certify import newton_multiplicity
+        from newton import newton_multiplicity
         m = newton_multiplicity(P, node.vars, h=list(node.h)) or 1
     except Exception:
         m = 1
@@ -432,36 +433,9 @@ def _demo():
         print(f"  {label:<18} イデアル版 {str(got):<14} 多項式版 {str(ref):<14}"
               f" {time.time()-t0:5.1f}s{mark}")
 
-    print("\n" + "=" * 78)
-    print("Vandermonde 型 (Aoyagi の真値と比較)")
-    print("=" * 78)
-    import sys
-    sys.path.insert(0, "bench")
-    try:
-        from vandermonde import lambda_N1, vandermonde_ideal
-    except Exception:
-        print("  bench/vandermonde.py が見つかりません")
-        return
-    for (M, N, H, Q) in [(1, 1, 1, 1), (1, 1, 2, 1), (1, 1, 2, 2),
-                         (1, 1, 3, 1), (2, 1, 2, 1), (1, 2, 2, 1)]:
-        G, v = vandermonde_ideal(M, N, H, Q)
-        truth = lambda_N1(M, H, Q) if N == 1 else (None, None)
-        f = sp.expand(sum(t**2 for t in G))
-        t0 = time.time()
-        try:
-            r = resolve_ideal(G, v, max_depth=12)
-            got = f"{r.rlct} (m={r.multiplicity}, 正則{r.n_regular})"
-            ok = (truth[0] is None) or (r.rlct == truth[0])
-        except ResolutionFailure as e:
-            got, ok = f"FAIL[{e.reason}]", False
-        try:
-            ref = str(resolve_singularities(f, v, prune="ties", weighted=True,
-                                            max_depth=12).rlct)
-        except ResolutionFailure as e:
-            ref = f"FAIL[{e.reason}]"
-        print(f"  M={M} N={N} H={H} Q={Q}  真値 {str(truth[0]):<5} "
-              f"イデアル版 {got:<26} 多項式版 {ref:<8} {time.time()-t0:5.1f}s"
-              f" {'OK' if ok else '<- 不一致'}")
+    print("\n  (Vandermonde 型との比較は vandermonde.py の demo_ideal_route() に移した。")
+    print("   本体がテストデータを import しないようにするため。)")
+
 
 
 if __name__ == "__main__":

@@ -242,11 +242,11 @@ def _route_power_form(f, gens) -> Optional[FamilyResult]:
 
 def _route_newton(f, gens) -> Optional[FamilyResult]:
     try:
-        from certify import newton_nondegenerate
-        from resolve_singularity import newton_rlct
+        from newton import newton_nondegenerate
+        from newton import newton_rlct
     except Exception:
         return None
-    from certify import principal_face_compact
+    from newton import principal_face_compact
     st, _ = newton_nondegenerate(f, gens, timeout_ms=8000)
     if st != "proved":
         return None
@@ -261,7 +261,7 @@ def _route_newton(f, gens) -> Optional[FamilyResult]:
     # 位数は「対角線が当たる点を通るファセットの法線の階数」で決まる
     # (m = n - dim(最小面))。トーリック解消で扇を細分しても同じ値になる。
     try:
-        from certify import newton_multiplicity
+        from newton import newton_multiplicity
         m = newton_multiplicity(f, gens)
     except Exception:
         m = None

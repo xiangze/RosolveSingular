@@ -250,7 +250,7 @@ def _quotient_dimension(gens_ideal, gens) -> Optional[int]:
 def _isolated_at_origin(f, gens, timeout_ms: int = 8000) -> str:
     """原点以外に特異点が無いか (grad f = 0 かつ x != 0 が充足不能か)。"""
     try:
-        from certify import _HAS_Z3, _to_z3
+        from newton import _HAS_Z3, _to_z3
         import z3
     except Exception:
         return "unknown"
@@ -476,22 +476,12 @@ def _demo():
         print()
 
     print("=" * 70)
-    print("RLCT との関係 (1/m <= lambda <= n/m の確認)")
+    print("RLCT との関係")
     print("=" * 70)
-    try:
-        from certify import rlct_certified
-        for label, f, g in [("x^2+y^3", x**2 + y**3, (x, y)),
-                            ("x^3+y^4+z^5", x**3 + y**4 + z**5, (x, y, z)),
-                            ("x^2+y^2+z^2", x**2 + y**2 + z**2, (x, y, z))]:
-            m = multiplicity(f, g)
-            lam, st, how = rlct_certified(f, g, timeout_ms=8000)
-            n = len(g)
-            ok = (sp.Rational(1, m) <= lam <= sp.Rational(n, m))
-            print(f"  {label:<16} m={m} n={n} lambda={lam} ({st}) "
-                  f"1/m={sp.Rational(1,m)} n/m={sp.Rational(n,m)} "
-                  f"-> {'OK' if ok else '!! 不等式が破れている'}")
-    except Exception as e:                        # noqa: BLE001
-        print(f"  (certify を読み込めません: {e})")
+    print("  1/m <= lambda <= n/m の検査は oracles.multiplicity_bounds と")
+    print("  guards の independent_tests が持っている (certify への依存を")
+    print("  このモジュールに持ち込まないため、ここでは行わない)。")
+
 
 
 if __name__ == "__main__":

@@ -80,12 +80,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import sympy as sp
 
-from resolve_singularity import (
-    Resolution,
-    ResolutionFailure,
-    newton_rlct,
-    resolve_singularities,
-)
+from resolve_singularity import Resolution, ResolutionFailure, resolve_singularities
+from newton import newton_rlct
 
 try:
     from timing import timed as _timed
@@ -573,7 +569,7 @@ def local_rlct_from_ideal(
         # (LP + 有限個の Z3 判定だけなので、変数が多いほど効く)。
         lam_core = m_core = None
         try:
-            from certify import newton_multiplicity, rlct_via_newton
+            from newton import newton_multiplicity, rlct_via_newton
             with _timed("newton"):
                 lam_n, st_n = rlct_via_newton(K, core_vars, timeout_ms=8000)
             if st_n == "proved" and lam_n is not sp.oo:

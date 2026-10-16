@@ -21,7 +21,8 @@ from typing import List
 
 import sympy as sp
 
-from certify import Box, certify, normal_crossing_on_box, newton_nondegenerate
+from certify import certify
+from newton import Box, normal_crossing_on_box, newton_nondegenerate
 from resolve_singularity import resolve_singularities
 
 
@@ -76,8 +77,7 @@ def negative_tests() -> List[GuardResult]:
     # f = -9*x0 - 38*x1^2*x2 は原点で勾配が非零なので lambda = 1 が真値だが、
     # コンパクトな面の上では非退化で、LP は 3/2 を返す。主面は x2 方向に
     # 伸びる非コンパクトな面なので、この経路で proved にしてはいけない。
-    from certify import (newton_faces, principal_face_compact,
-                         rlct_via_newton)
+    from newton import newton_faces, principal_face_compact, rlct_via_newton
     fsm = -9 * x + (-38) * y**2 * z
     lam_n, st_n = rlct_via_newton(fsm, (x, y, z), timeout_ms=6000)
     out.append(GuardResult(
@@ -583,7 +583,7 @@ def groebner_filter_tests() -> List[GuardResult]:
       (4) フィルタを入れても `newton_nondegenerate` の答えが変わらない
           (フィルタ有/無で全コーパスを突き合わせる)
     """
-    import certify as C
+    import newton as C   # Groebner フィルタは newton 側に居る
     out: List[GuardResult] = []
     x, y, z = sp.symbols("x y z", real=True)
 
@@ -1119,7 +1119,7 @@ def lemma_shortcut_tests() -> List[GuardResult]:
         lambda(x^3)+lambda(y^2) = 5/6 とは一致しない。
     """
     from lemmas import monotone_lower_bound, squeeze_rlct
-    from resolve_singularity import newton_rlct
+    from newton import newton_rlct
 
     x, y, z, w = sp.symbols("x y z w", real=True)
     out: List[GuardResult] = []

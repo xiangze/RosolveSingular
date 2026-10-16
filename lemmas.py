@@ -204,7 +204,7 @@ def squeeze_rlct(f, gens, generators: Optional[Sequence[sp.Expr]] = None,
 
     位数 m は決まらない点に注意 (Squeeze は lambda だけを返す)。
     """
-    from resolve_singularity import newton_rlct
+    from newton import newton_rlct
 
     gens = tuple(gens)
     out = Squeeze()
@@ -348,9 +348,10 @@ def _sub_local_rlct(p, sup, k, h, gens):
     まずニュートン非退化を試し、だめならブローアップして certify にかける。
     証明できなければ None (呼び出し側は分解をあきらめる)。
     """
-    from certify import certify, newton_multiplicity, newton_nondegenerate
-    from resolve_singularity import (ResolutionFailure, newton_rlct,
-                                     resolve_singularities)
+    from certify import certify
+    from newton import newton_multiplicity, newton_nondegenerate
+    from resolve_singularity import ResolutionFailure, resolve_singularities
+    from newton import newton_rlct
 
     vs = tuple(sup)
     kk = [k[gens.index(v)] for v in vs]

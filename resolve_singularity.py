@@ -186,6 +186,7 @@ ResolutionFailure にも途中までの木が入っているので e.render_tree
 使い方
 ------------------------------------------------------------------
     import sympy as sp
+
     from resolve_singularity import resolve_singularities, ResolutionFailure
 
     x, y = sp.symbols("x y", real=True)
@@ -205,6 +206,17 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import sympy as sp
+
+# ニュートン多面体の層は newton.py に分離した (REORG_PLAN.ja.md §2)。
+# 既存の呼び出し側との互換のためここでも再公開する (同じオブジェクト)。
+from newton import (  # noqa: F401
+    _ilp_min_hitting_set,
+    _ilp_min_hitting_set_scipy,
+    _lp_newton_value,
+    _lp_var,
+    _pick_backend,
+    newton_rlct,
+)
 
 
 # ----------------------------------------------------------------------
@@ -232,161 +244,6 @@ except Exception:      # pragma: no cover
     @_cm
     def _timed(_name):           # 計時モジュールが無くても動く
         yield
-
-
-def _pick_backend(backend: str, hot: bool = False) -> str:
-    """'pulp' / 'scipy' / 'auto' を実際のバックエンド名に解決する。
-
-    hot=True (探索ループ内で何度も呼ばれる用途) では、プロセス起動を伴う
-    CBC より in-process の scipy(HiGHS) を優先する。
-    """
-    if backend == "pulp":
-        if not _HAS_PULP:
-            raise RuntimeError("pulp がインストールされていません (pip install pulp)")
-        return "pulp"
-    if backend == "scipy":
-        if not _HAS_SCIPY:
-            raise RuntimeError("scipy がインストールされていません")
-        return "scipy"
-    # in-process の scipy(HiGHS) を常に優先する。CBC は解くたびに
-    # サブプロセスを起動するので、初回 585ms / 以降 5.6ms に対し
-    # scipy は 1.7ms (実測)。LP は整数制約がないので HiGHS で十分。
-    del hot                              # 既存の呼び出し互換のため残す
-    return "scipy" if _HAS_SCIPY else ("pulp" if _HAS_PULP else "none")
-
-
-def _lp_var(name: str, *, low=None, cat=None):
-    """pulp の LpVariable を版差を吸収して作る。
-
-    pulp 4.0 で lowBound= キーワードが通らない環境が報告されているので、
-    lowBound -> low_bound -> 位置引数 の順に試す。
-    """
-    kw = {}
-    if cat is not None:
-        kw["cat"] = cat
-    if low is None:
-        return _pulp.LpVariable(name, **kw)
-    for key in ("lowBound", "low_bound"):
-        try:
-            return _pulp.LpVariable(name, **{key: low}, **kw)
-        except TypeError:
-            continue
-    return _pulp.LpVariable(name, low, **kw)
-
-
-def _lp_newton_value(monoms: Sequence[Sequence[int]],
-                     hplus: Sequence[int],
-                     backend: str = "auto",
-                     hot: bool = False) -> float:
-    """ニュートン多面体による RLCT の上界を線形計画で求める。
-
-    振幅 x^h をもつ局所データ (f, x^h dx) に対し、Newton(f) の頂点集合を
-    {a} とすると
-
-        maximize   sum_a nu_a
-        s.t.       sum_a nu_a * a_j <= h_j + 1   (各 j),   nu >= 0
-
-    の最適値が「ニュートン多面体的な lambda」に一致する。単項式
-    f = x^k のときは値が min_j (h_j+1)/k_j に退化し、一般には真の RLCT の
-    *上界* になる (Varchenko / Lin: 非退化なら等号)。上界なので分枝限定の
-    incumbent (primal bound) としてそのまま使える。
-    """
-    n = len(hplus)
-    monoms = [tuple(m) for m in monoms]
-    if any(all(e == 0 for e in m) for m in monoms):
-        return float("inf")          # 定数項 (原点で消えない) -> 極なし
-    N = len(monoms)
-    if N == 0:
-        return float("inf")
-    which = _pick_backend(backend, hot=hot)
-
-    if which == "pulp":
-        prob = _pulp.LpProblem("newton_rlct", _pulp.LpMaximize)
-        nu = [_lp_var(f"nu{a}", low=0) for a in range(N)]
-        prob += _pulp.lpSum(nu)
-        for j in range(n):
-            coeffs = [(nu[a], monoms[a][j]) for a in range(N) if monoms[a][j]]
-            if coeffs:
-                prob += _pulp.LpAffineExpression(coeffs) <= hplus[j]
-        status = prob.solve(_pulp.PULP_CBC_CMD(msg=0))
-        if _pulp.LpStatus[status] == "Unbounded":
-            return float("inf")
-        if _pulp.LpStatus[status] != "Optimal":
-            return float("inf")
-        return float(_pulp.value(prob.objective))
-
-    if which == "scipy":
-        c = [-1.0] * N
-        A_ub = [[float(monoms[a][j]) for a in range(N)] for j in range(n)]
-        b_ub = [float(v) for v in hplus]
-        res = _linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=[(0, None)] * N)
-        if res.status == 3:          # unbounded
-            return float("inf")
-        if not res.success:
-            return float("inf")
-        return float(-res.fun)
-
-    return float("inf")              # ソルバーが無ければ上界なし (枝刈りしない)
-
-
-def _ilp_min_hitting_set_scipy(supports: Sequence[frozenset],
-                               n: int) -> Optional[List[int]]:
-    """最小ヒッティング集合を scipy.optimize.milp (HiGHS) で解く。
-
-    CBC と違ってプロセス起動がないので、初回 585ms の立ち上がりが消える
-    (実測 2.7ms/回)。整数最適解なので結果は CBC と同じ。
-    """
-    try:
-        import numpy as np
-        from scipy.optimize import Bounds, LinearConstraint, milp
-    except Exception:
-        return None
-    A = np.zeros((len(supports), n))
-    for i, S in enumerate(supports):
-        for j in S:
-            if 0 <= j < n:
-                A[i, j] = 1.0
-    if not A.any(axis=1).all():
-        return None                  # 空の台 -> 被覆不能。呼び出し側に委ねる
-    try:
-        res = milp(c=np.ones(n),
-                   constraints=LinearConstraint(A, lb=1.0, ub=np.inf),
-                   integrality=np.ones(n), bounds=Bounds(0, 1))
-    except Exception:
-        return None
-    if not res.success or res.x is None:
-        return None
-    return sorted(j for j in range(n) if res.x[j] > 0.5)
-
-
-def _ilp_min_hitting_set(supports: Sequence[frozenset], n: int,
-                         backend: str = "auto") -> Optional[List[int]]:
-    """最小ヒッティング集合 (集合被覆) を 0-1 整数計画として解く。
-
-        minimize  sum_j z_j
-        s.t.      sum_{j in S} z_j >= 1  (各単項式の台 S),  z_j in {0,1}
-
-    in-process の scipy.optimize.milp (HiGHS) を優先し、無ければ pulp
-    (CBC) に投げる。解けなければ None を返し、呼び出し側の分枝限定に
-    フォールバックする。
-    """
-    if not supports:
-        return []
-    if backend in ("auto", "scipy") and _HAS_SCIPY:
-        r = _ilp_min_hitting_set_scipy(supports, n)
-        if r is not None or backend == "scipy":
-            return r
-    if not _HAS_PULP:
-        return None
-    prob = _pulp.LpProblem("min_center", _pulp.LpMinimize)
-    z = {j: _lp_var(f"z{j}", cat="Binary") for j in range(n)}
-    prob += _pulp.lpSum(z.values())
-    for S in supports:
-        prob += _pulp.lpSum(z[j] for j in S) >= 1
-    status = prob.solve(_pulp.PULP_CBC_CMD(msg=0))
-    if _pulp.LpStatus[status] != "Optimal":
-        return None
-    return sorted(j for j in range(n) if z[j].value() is not None and z[j].value() > 0.5)
 
 
 __all__ = [
@@ -896,8 +753,7 @@ def _chart_newton_close(k: Sequence[int], p: sp.Poly, h: Sequence[int],
 
     result = None
     try:
-        from certify import (newton_nondegenerate, newton_multiplicity,
-                             principal_face_compact)
+        from newton import newton_nondegenerate, newton_multiplicity, principal_face_compact
         P = sum(c * sp.prod([v ** e for v, e in zip(gens, m)])
                 for c, m in zip(p.coeffs(), monoms))
         st, _face = newton_nondegenerate(P, gens, timeout_ms=timeout_ms)
@@ -2017,40 +1873,6 @@ def render_charts(nodes: Dict[str, "Chart"], *, path: str = "resolution_tree",
 # ----------------------------------------------------------------------
 # ニュートン多面体によるクロスチェック (非退化な f に対して厳密)
 # ----------------------------------------------------------------------
-def newton_rlct(f, gens: Optional[Sequence[sp.Symbol]] = None,
-                h: Optional[Sequence[int]] = None,
-                backend: str = "auto",
-                max_denominator: int = 10 ** 6):
-    """ニュートン多面体による RLCT を線形計画で求める (Varchenko / Lin)。
-
-    振幅 x^h をもつ局所データ (f, x^h dx) に対し、Newton(f) の指数ベクトル
-    {a} を使って
-
-        maximize   sum_a nu_a
-        s.t.       sum_a nu_a * a_j <= h_j + 1  (各 j),   nu >= 0
-
-    を解く。h を省略すると h = 0、すなわち通常の
-    「対角線がニュートン多面体に到達する距離 t の逆数 1/t」に一致する。
-
-    f が (実数体上) ニュートン多面体に関して非退化なら真の RLCT と一致し、
-    一般には *上界* を与える。多変数でも LP なので高速で、
-    resolve_singularities の枝刈り (incumbent) と検算の両方に使われる。
-
-    backend : 'auto' | 'pulp' | 'scipy'
-        'pulp' は CBC などの外部ソルバーを呼ぶ。'auto' は pulp を優先。
-    """
-    if gens is None:
-        gens = sorted(f.free_symbols, key=lambda s: s.name)
-    gens = tuple(gens)
-    p = sp.Poly(sp.expand(f), *gens)
-    if h is None:
-        h = [0] * len(gens)
-    val = _lp_newton_value(p.monoms(), [hj + 1 for hj in h], backend=backend)
-    if val == float("inf"):
-        return sp.oo
-    return sp.Rational(val).limit_denominator(max_denominator)
-
-
 # ----------------------------------------------------------------------
 # デモ
 # ----------------------------------------------------------------------

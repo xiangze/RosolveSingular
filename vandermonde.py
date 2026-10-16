@@ -238,3 +238,41 @@ def _demo():
 
 if __name__ == "__main__":
     _demo()
+
+
+# ----------------------------------------------------------------------
+# イデアル経路との比較 (ideal_resolve._demo から移動)
+# ----------------------------------------------------------------------
+def demo_ideal_route():
+    """イデアルを運ぶ解消を Vandermonde の真値と比べる。
+
+    もとは `ideal_resolve._demo` にあったが、**本体がテストデータ
+    (このモジュール) を import するのは依存の向きが逆**なので、
+    真値を持っているこちら側に移した (REORG_PLAN.ja.md §2)。
+    """
+    import time
+    from ideal_resolve import resolve_ideal
+    print("\n" + "=" * 78)
+    print("Vandermonde 型 (Aoyagi の真値と比較)")
+    print("=" * 78)
+    for (M, N, H, Q) in [(1, 1, 1, 1), (1, 1, 2, 1), (1, 1, 2, 2),
+                         (1, 1, 3, 1), (2, 1, 2, 1), (1, 2, 2, 1)]:
+        G, v = vandermonde_ideal(M, N, H, Q)
+        truth = lambda_N1(M, H, Q) if N == 1 else (None, None)
+        f = sp.expand(sum(t**2 for t in G))
+        t0 = time.time()
+        try:
+            r = resolve_ideal(G, v, max_depth=12)
+            got = f"{r.rlct} (m={r.multiplicity}, 正則{r.n_regular})"
+            ok = (truth[0] is None) or (r.rlct == truth[0])
+        except ResolutionFailure as e:
+            got, ok = f"FAIL[{e.reason}]", False
+        try:
+            ref = str(resolve_singularities(f, v, prune="ties", weighted=True,
+                                            max_depth=12).rlct)
+        except ResolutionFailure as e:
+            ref = f"FAIL[{e.reason}]"
+        print(f"  M={M} N={N} H={H} Q={Q}  真値 {str(truth[0]):<5} "
+              f"イデアル版 {got:<26} 多項式版 {ref:<8} {time.time()-t0:5.1f}s"
+              f" {'OK' if ok else '<- 不一致'}")
+

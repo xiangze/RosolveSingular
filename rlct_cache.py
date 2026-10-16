@@ -321,7 +321,7 @@ class Cache:
                 return False
             if poly is None or gens is None or k is None or h is None:
                 return True
-            from resolve_singularity import _lp_newton_value
+            from newton import _lp_newton_value
             monoms = [tuple(ki + ei for ki, ei in zip(k, m))
                       for m in poly.monoms()]
             ub = _lp_newton_value(monoms, [hj + 1 for hj in h], hot=True)

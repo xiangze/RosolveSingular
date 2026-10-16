@@ -304,6 +304,154 @@ def coordinate_invariance_tests() -> List[GuardResult]:
     return out
 
 
+
+def dln_trajectory_tests() -> List[GuardResult]:
+    """学習軌道上の厳密 λ (`dln_trajectory.py`) が正しく組めているか。
+
+    2-2-2 の DLN を教師の特異値 (3, 1) で学習し、階数 k=1, 2 のプラトーから
+    1 点ずつ取って次を検査する (k=0 は原点で解消に 30 秒近くかかるので省く)。
+
+    (1) 軌道が階数 0 → 1 → 2 を順に通り、各プラトーで丸めが最小階数の層に入る
+    (2) 丸めた点で、**独立な経路** (`torch_rlct` の記号的解消) の λ が
+        Aoyagi の閉形式と一致する
+    (3) 隠れ層を座標軸に揃えた点 (`align_hidden`) では位数 m も一致する
+    (4) 層ごとの厳密値 rank(W_after)·rank(W_before X)/2 が、torch の
+        Jacobian の数値階数/2 と一致する
+    (5) 自己教師の終点で、二次近似の予測の正則項が `gamma_bias` と一致し、
+        勾配項がほぼ 0
+    """
+    out: List[GuardResult] = []
+    try:
+        import torch
+    except Exception:                                    # noqa: BLE001
+        return out
+    from dln_trajectory import (DLNConfig, align_hidden, detect_rank,
+                                exact_full, exact_layers, make_data, make_dln,
+                                quadratic_prediction, snap_to_rank,
+                                train_checkpoints)
+    from llc_estimate import gamma_bias, realizable_targets
+    from torch_rlct import torch_local_rlct
+
+    cfg = DLNConfig(dims=(2, 2, 2), teacher_sv=(3.0, 1.0), n_data=8,
+                    init_scale=1e-3, lr=0.05, n_steps=600, every=3)
+    X, y, _ = make_data(cfg)
+    steps, states, _ = train_checkpoints(cfg, X, y)
+    net = make_dln(cfg.dims, cfg.init_scale, cfg.seed)
+    seq, first = [], {}
+    for t, sd in zip(steps, states):
+        net.load_state_dict(sd)
+        ri = detect_rank(net, cfg.teacher_sv)
+        if not ri.ambiguous:
+            seq.append(ri.k)
+            first.setdefault(ri.k, sd)
+    out.append(GuardResult(
+        "dln軌道: 階数が 0→1→2 を単調に通る",
+        seq == sorted(seq) and set(seq) == {0, 1, 2},
+        f"通った階数 {sorted(set(seq))}"))
+
+    for k in (1, 2):
+        if k not in first:
+            continue
+        net.load_state_dict(first[k])
+        bar, ok, dist = snap_to_rank(net, k)
+        out.append(GuardResult(f"dln軌道: k={k} の丸めが最小階数の層に入る",
+                               ok, f"相対距離 {dist:.1e}"))
+        lam_a, m_a = exact_full(cfg.dims, k)
+        # 解消経路は **隠れ層を座標軸に揃えた点** で使う。一般の座標では
+        # λ も m も座標に依存しうる (known_issues の DLN 項目を参照)。
+        ali = align_hidden(bar, k)
+        rep2 = torch_local_rlct(copy.deepcopy(ali).float(), X.float()) \
+            if ali is not None else None
+        # .float() はモジュールをその場で変換するので複製してから渡す
+        rep = torch_local_rlct(copy.deepcopy(bar).float(), X.float())
+        got = (getattr(getattr(rep2, "local", None), "rlct", None),
+               getattr(getattr(rep2, "local", None), "multiplicity", None))
+        out.append(GuardResult(
+            f"dln軌道: k={k} 揃えた座標で解消経路の (λ, m) が Aoyagi と一致",
+            got == (lam_a, m_a),
+            f"揃えた座標 {got} / 一般の座標 ({rep.local.rlct}, "
+            f"{rep.local.multiplicity}) / Aoyagi ({lam_a}, {m_a})"))
+
+        # (4) 層ごとの厳密値 対 Jacobian の数値階数
+        lays = exact_layers(bar, X)
+        jr = []
+        for l, m in enumerate(bar):
+            W0 = m.weight.detach().clone()
+
+            def f(Wl, l=l):
+                h = X.T
+                for j, mm in enumerate(bar):
+                    h = (Wl if j == l else mm.weight.detach()) @ h
+                return h.reshape(-1)
+            J = torch.autograd.functional.jacobian(f, W0).reshape(-1, W0.numel())
+            jr.append(int(torch.linalg.matrix_rank(J, rtol=1e-8)))
+        out.append(GuardResult(
+            f"dln軌道: k={k} 層ごとの λ = Jacobian 階数/2",
+            [float(v) for v in lays] == [r / 2 for r in jr],
+            f"厳密 {[str(v) for v in lays]} / 数値 {[r / 2 for r in jr]}"))
+
+    # (5) 自己教師の終点: 二次近似 = gamma_bias、勾配項 ≈ 0
+    net.load_state_dict(states[-1])
+    bar, _, _ = snap_to_rank(net, 2)
+    yb = realizable_targets(bar, X)
+    q = quadratic_prediction(bar, X, yb, gamma=1.0)
+    names = [n for n, _ in bar.named_parameters()]
+    from dln_trajectory import _flat_loss
+    fl, th = _flat_loss(bar, X, yb, names)
+    Hm = torch.autograd.functional.hessian(fl, th)
+    gb = gamma_bias(0.5 * (Hm + Hm.T), int(X.shape[0]), 1.0)
+    out.append(GuardResult(
+        "dln軌道: 二次近似の正則項 = gamma_bias (自己教師、g=0)",
+        q["proper"] and abs(q["regular"] - gb) < 1e-8 and abs(q["gradient"]) < 1e-12,
+        f"regular={q['regular']:.6f} gamma_bias={gb:.6f} grad={q['gradient']:.1e}"))
+    return out
+
+
+
+def _dln_multiplicity_coordinate_issue() -> List[GuardResult]:
+    """[既知] 解消経路 (`torch_local_rlct`) の (λ, m) が隠れ層の座標に依存する。
+
+    2-2-2 の DLN、積の階数 1 で各因子も階数 1 の点。対称性 W1→GW1, W2→W2G⁻¹
+    は局所 RLCT と位数を保つので、同じ軌道上の点はすべて (λ, m) = (2, 2)
+    (= Aoyagi の (λ, θ)) のはず。実測:
+
+        隠れ層を座標軸に揃えた点 (align_hidden)  →  (2, 2)   正しい
+        学習軌道の丸め点 (k=1)                    →  (2, 1)   m を過小評価
+        下の一般の向きの点                        →  (5/2, 2) **λ を過大評価**
+
+    `LocalRLCT` は証明書の status を持たないので、呼び出し側からは
+    誤りが見えない (`rlct-filter-rrr-findings` の「nn_rlct が certify を
+    通さない」と同根と思われる)。**学習軌道の λ を解消経路で計算しては
+    いけない**理由がこれで、`dln_trajectory` は Aoyagi の閉形式を使い、
+    解消経路は揃えた座標での検算にだけ使う。
+    """
+    try:
+        import torch
+        from dln_trajectory import exact_full, make_dln
+        from torch_rlct import torch_local_rlct
+    except Exception:                                    # noqa: BLE001
+        return []
+    net = make_dln((2, 2, 2), 1.0, 0)
+    with torch.no_grad():
+        # 階数 1 の因子を一般の向きで: W1 = a vᵀ, W2 = u bᵀ (bᵀa ≠ 0)
+        a = torch.tensor([0.6, 0.8], dtype=torch.float64)
+        v = torch.tensor([1.0, 2.0], dtype=torch.float64)
+        u = torch.tensor([1.0, 3.0], dtype=torch.float64)
+        b = torch.tensor([0.8, -0.3], dtype=torch.float64)
+        net[0].weight.copy_(torch.outer(a, v))
+        net[1].weight.copy_(torch.outer(u, b))
+    X = torch.eye(2, dtype=torch.float64)
+    rep = torch_local_rlct(copy.deepcopy(net).float(), X.float())
+    lam, th = exact_full((2, 2, 2), 1)
+    ok = rep.local.rlct == lam and rep.local.multiplicity == th
+    return [GuardResult(
+        "[既知] DLN の解消経路の (λ, m) が隠れ層の座標に依存 (一般の座標)",
+        ok,
+        f"解消 (λ, m)=({rep.local.rlct}, {rep.local.multiplicity}) / "
+        f"Aoyagi ({lam}, {th})"
+        + ("" if ok else "  <- 未修正 (align_hidden で揃えると一致する)"))]
+
+
 def known_issues() -> List[GuardResult]:
     """既知の未修正バグ。**緑のゲートには数えない**が必ず報告する。
 
@@ -329,7 +477,7 @@ def known_issues() -> List[GuardResult]:
         `vandermonde_never_proved_wrong_tests` にある。
     """
     from resolve_singularity import resolve_singularities
-    out: List[GuardResult] = []
+    out: List[GuardResult] = _dln_multiplicity_coordinate_issue()
     sys.path[:0] = ["."]
     try:
         from vandermonde import lambda_N1, vandermonde_ideal
@@ -1555,7 +1703,8 @@ def run_all(verbose: bool = True):
            + taylor_sweep_tests() + analytic_activation_tests()
            + cnn_depth_tests() + ideal_coordinate_invariance_tests()
            + vandermonde_never_proved_wrong_tests()
-           + dln_formula_tests() + resnet_tests())
+           + dln_formula_tests() + resnet_tests()
+           + dln_trajectory_tests())
     if verbose:
         for r in res:
             print("  " + str(r))

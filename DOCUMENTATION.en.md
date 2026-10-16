@@ -7,6 +7,47 @@ learning coefficients in singular learning theory (SLT).
 
 ---
 
+## 0. Layout (hierarchised 2026-10-17)
+
+**Dependencies point downwards only; there are no cycles.**
+`bench.guards.layering_tests` checks this on every run (function-level imports
+count too).
+
+```
+rlct/core/     timing, newton, resolve_singularity, ideal_resolve,
+               invariants, rlct_cache, certify
+rlct/closers/  families, lemmas, dln_oracle, lc_filter, strata_closer
+rlct/models/   nn_rlct, torch_rlct, transformer_rlct, resnet_rlct
+rlct/export/   lean_export
+rlct/data.py   image data loading
+exp/           train_rlct, train_resnet, llc_estimate, llc_compare,
+               cnn_sweep, taylor_sweep, random_regression, stage_*
+bench/         guards, cases, nn_cases, known_families, oracles, agreement,
+               aoyagi_lemmas, failures, independent, regression, run, report,
+               build_cache, vandermonde, dln, atw_invariant, bench_strata
+```
+
+`rlct/core/newton.py` is a **leaf** (polyhedron, face enumeration, LP,
+nondegeneracy). It used to live inside `certify.py`, which is why the core had
+a 9-module strongly connected component; splitting it killed four cycle edges.
+
+`rlct/closers/*` **do not import the certifier or the resolver**. The
+sub-problem solver is injected from above via
+`lemmas.install_subsolver()`, and the default one is installed when `certify`
+is imported. With nothing injected the closer returns `None` and gives up on
+the split — it **fails to the sound side**: no value changes, it only misses
+an opportunity.
+
+Run everything **from the repository root** with `-m`:
+
+```sh
+python -m bench.guards
+python -m bench.regression --all
+python -m exp.train_rlct --model mlp --size 4 --epochs 300 --rlct
+```
+
+`REORG_PLAN.ja.md` has the full record and the measurements.
+
 ## 1. Architecture
 
 ```

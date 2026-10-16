@@ -6,6 +6,45 @@
 
 ---
 
+## 0. 構成 (2026-10-17 に階層化)
+
+**依存は常に下向きで、循環はありません。**`bench.guards.layering_tests` が
+毎回検査します (関数内 import も数えます)。
+
+```
+rlct/core/     timing, newton, resolve_singularity, ideal_resolve,
+               invariants, rlct_cache, certify
+rlct/closers/  families, lemmas, dln_oracle, lc_filter, strata_closer
+rlct/models/   nn_rlct, torch_rlct, transformer_rlct, resnet_rlct
+rlct/export/   lean_export
+rlct/data.py   画像データの読み込み
+exp/           train_rlct, train_resnet, llc_estimate, llc_compare,
+               cnn_sweep, taylor_sweep, random_regression, stage_*
+bench/         guards, cases, nn_cases, known_families, oracles, agreement,
+               aoyagi_lemmas, failures, independent, regression, run, report,
+               build_cache, vandermonde, dln, atw_invariant, bench_strata
+```
+
+`rlct/core/newton.py` は **葉** (多面体・面の列挙・LP・非退化判定)。
+`certify.py` がこれと同居していたため核心に 9 モジュールの強連結成分が
+あったが、分離で 4 辺が消えた。
+
+`rlct/closers/*` は **判定器や解消器を import しません**。部分問題の
+解き手は `lemmas.install_subsolver()` で上の層から注入され、既定の解き手は
+`certify` の import 時に入ります。注入が無ければ `None` を返して分解を
+あきらめる — **健全側に倒れる**動作で、値が狂うことはなく
+「分解できる場所を見逃す」だけです。
+
+実行は**リポジトリの根から** `-m` で:
+
+```sh
+python -m bench.guards
+python -m bench.regression --all
+python -m exp.train_rlct --model mlp --size 4 --epochs 300 --rlct
+```
+
+経緯と実測値は `REORG_PLAN.ja.md` にあります。
+
 ## 1. 全体像
 
 ```

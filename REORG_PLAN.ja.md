@@ -1,4 +1,78 @@
-# ファイル構成の整理・階層化 — 診断と移行計画 (2026-10-13)
+# ファイル構成の整理・階層化 — 実施記録 (2026-10-13 計画 / 2026-10-17 実施)
+
+対象: `xiangze/RosolveSingular`。
+
+> ## 実施結果 (2026-10-17)
+>
+> **循環依存を 0 にし、46 本を 3 つのパッケージに階層化した。ガードは全段で
+> 213/213 緑、λ と m は 1 件も変わっていない。**
+>
+> | | 実施前 | 実施後 |
+> |---|---|---|
+> | 最大の強連結成分 | **9 モジュール** (6,000 行超) | **0** |
+> | 層の深さ | 9 段 + 塊 | 12 段 (塊なし) |
+> | ルート直下の .py | 46 本 | 0 本 (`rlct/` `exp/` `bench/`) |
+> | 関数内に隠れた循環 import | 20 本以上 | 0 |
+> | ガード | 213/213 | **216/216** (階層の検査 3 本を追加) |
+>
+> ### 段ごとの実施内容
+>
+> **段 1: `rlct/core/newton.py` の切り出し** (コミット `refactor(1)`)
+> `certify.py` が「判定器」と「ニュートン多面体の道具」を同居させていた。
+> 後者と、`resolve_singularity.py` の LP/ILP を `newton.py` に分離した。
+>
+> | | 前 | 後 |
+> |---|---|---|
+> | `certify.py` | 1633 行 | 1064 行 |
+> | `resolve_singularity.py` | 2027 行 | 1865 行 |
+> | `newton.py` | — | 899 行 |
+>
+> あわせて `_demo()` の中だけで上の層を import していた 3 箇所を解消
+> (`invariants` の RLCT 節を除去、`ideal_resolve` の Vandermonde 比較を
+> `vandermonde.demo_ideal_route()` へ、`lean_export._demo` を
+> `bench/demo_lean.py` へ)。**強連結成分 9 -> 4。**
+>
+> **段 2: 依存の逆転 3 箇所** (コミット `refactor(2)`)
+> * `lemmas` の相互再帰 -> `install_subsolver()` で上の層から解き手を注入。
+>   既定の解き手は `certify` の import 時に入る。注入が無ければ `None` を
+>   返して分解をあきらめる (**健全側に倒れる**)。
+> * `resnet_rlct <-> train_resnet` -> データ読み込みを `rlct/data.py` に分離。
+> * `failures <-> run` -> `make_predicate` が `run_case` を引数で受け取る。
+>
+> **強連結成分 4 -> 0。**
+>
+> **段 3: パッケージ化** (コミット `refactor(3)`)
+> 46 本を `rlct/{core,closers,models,export}` `exp/` `bench/` に移し、
+> import 231 箇所を書き換えた。モジュール名は変えていない
+> (`nn_rlct` は `rlct.models.nn_rlct`)。
+>
+> **段 4: 循環を禁止するガード** (`bench.guards.layering_tests`)
+> (1) 強連結成分がサイズ 2 以上でないこと、(2) `newton` が葉であること・
+> `closers/*` が判定器を import しないこと・`rlct/` が `bench/` `exp/` を
+> import しないこと、(3) closer への結線が効いていること。
+> **関数内 import も数える。**故意に循環を仕込むと 2 本が赤になることを確認済み。
+>
+> ### 副産物として直したもの
+>
+> * `exp/cnn_sweep.py` と `exp/taylor_sweep.py` に **開発環境の絶対パス
+>   `/home/claude` が埋め込まれていた** (子プロセスの `sys.path` 細工)。
+>   他の環境では通らないので `__file__` から求める形に直した。
+> * `bench/guards.py` の `sys.path[:0] = ["."]` 5 箇所、`bench/build_cache.py`
+>   の同種 5 箇所、`bench/dln.py` と `bench/atw_invariant.py` の
+>   ディレクトリ探索 bootstrap を、パッケージ化により不要にして除去。
+> * `rlct_cache` のコード指紋のパスを新構成に合わせた。
+>
+> ### 残っている課題
+>
+> * `resolve_singularities` 656 行 / 分岐 138 の分解 (§H2 の closer 列への
+>   分解)。**この整理とは別の作業**として切り離すこと — 混ぜると、どちらが
+>   値を変えたのか分からなくなる。
+> * `closers/protocol.py` (closer の契約を型で表す) は未実装。現状は
+>   `install_subsolver` の 1 本だけで、契約は docstring にある。
+> * ドキュメントが記述する `bench/` 構成と実体が食い違っていた問題は解消したが、
+>   `DOCUMENTATION.ja.md` / `.en.md` の節番号は旧構成のまま。
+>
+> 以下は実施前の計画 (記録として残す)。実測値はすべて実施前のもの。
 
 対象: `xiangze/RosolveSingular`。手元の作業コピー (ルート 20 本 13,973 行 +
 `bench/` 16 本 5,506 行 = 36 本 19,479 行) を静的に解析した結果と、その上での提案。

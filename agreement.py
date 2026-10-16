@@ -32,12 +32,16 @@ E. **Vandermonde 行列型** (`known_families.vandermonde_cases`)
    「status が proved でないこと」が通れば合格とする扱いも併記する
    (`guards.vandermonde_never_proved_wrong_tests` と同じ基準)。
 
+G. **深層線形網** (`dln.dln_cases`)
+   Aoyagi (Neural Networks 172:106132, 2024) Theorem 1 の閉形式。
+   **LLC の数値推定が校正に使っている唯一の族**なので、ここでの一致が
+   一番効く。`dln.self_check()` が公式の実装自体を同論文 Theorem 2 と
+   657 件で突き合わせている。
+
 F. **行列分解 (深層線形網の最小形)**
    A (m×h) · B (h×n) の原点でのファイバー。単項式になる最小の場合
    (m=n=h=1 で K = a²b², λ = 1/2, m = 2) だけ真値を入れてある。
-   **一般の深層線形網の Aoyagi (Neural Networks 172:106132, 2024) の
-   閉形式は実装していない** — 公式の完全な記述 (M, a, ℓ, S_j の定義) を
-   この環境から取得できなかったため。原論文から取ってから入れること。
+   一般の深層線形網は **G** に入れた (`bench/dln.py`)。
 
 使い方
 ------
@@ -218,6 +222,9 @@ def _all_cases(families: Sequence[str]) -> List[Tuple]:
                       for n, f, g, fam, lam in kf.vandermonde_cases()]
     if "F" in families:
         cases += factorization_cases()
+    if "G" in families:
+        from dln import dln_cases
+        cases += dln_cases(max_vars=12)
     return cases
 
 
@@ -314,7 +321,7 @@ def summarize(recs: List[Dict]) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--families", default="A,B,C,D,E,F")
+    ap.add_argument("--families", default="A,B,C,D,E,F,G")
     ap.add_argument("--max-depth", type=int, default=14)
     ap.add_argument("--timeout", type=float, default=120.0)
     ap.add_argument("--out", default="")

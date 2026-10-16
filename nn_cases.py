@@ -113,6 +113,33 @@ def mlp_case(widths, activation="relu", degeneracy="redundant", n_data=6,
         for j in range(widths[0]):
             Ws[0][H - 1][j] = sp.Integer(0)
         bs[0][H - 1] = sp.Integer(-10)                 # 全データで不活性
+    elif degeneracy == "duplicate3" and H >= 3:
+        # 同一のユニットを 3 つ: 置換対称性が S_3 になり特異性が深くなる
+        for i in (1, 2):
+            for j in range(widths[0]):
+                Ws[0][i][j] = Ws[0][0][j]
+            bs[0][i] = bs[0][0]
+    elif degeneracy == "pair" and H >= 4:
+        # 2 組の重複ユニット
+        for j in range(widths[0]):
+            Ws[0][1][j] = Ws[0][0][j]
+            Ws[0][3][j] = Ws[0][2][j]
+        bs[0][1] = bs[0][0]
+        bs[0][3] = bs[0][2]
+    elif degeneracy == "opposite" and H >= 2:
+        # ReLU(z) - ReLU(-z) = z。符号を反転した 2 ユニットは 1 次関数に潰れる
+        for j in range(widths[0]):
+            Ws[0][1][j] = -Ws[0][0][j]
+        bs[0][1] = -bs[0][0]
+        for r in range(len(Ws[1])):
+            Ws[1][r][1] = -Ws[1][r][0]
+    elif degeneracy == "scaled" and H >= 2:
+        # 正斉次性の軌道上に置く: (a,b,c) -> (2a,2b,c/2)
+        for j in range(widths[0]):
+            Ws[0][1][j] = 2 * Ws[0][0][j]
+        bs[0][1] = 2 * bs[0][0]
+        for r in range(len(Ws[1])):
+            Ws[1][r][1] = Ws[1][r][0] / 2
     elif degeneracy == "zero" and H >= 1:
         for j in range(widths[0]):
             Ws[0][H - 1][j] = sp.Integer(0)
@@ -227,6 +254,143 @@ def mlp_case_retry(widths, activation, degeneracy, n_data, taylor_order,
     return None
 
 
+#: ReLU 用の中小規模アーキテクチャ
+RELU_ARCHS = [
+    (1, 2, 1), (1, 3, 1), (1, 4, 1), (1, 5, 1),
+    (2, 2, 1), (2, 3, 1), (2, 4, 1),
+    (3, 2, 1), (3, 3, 1),
+    (1, 2, 2), (2, 2, 2), (1, 3, 2), (2, 3, 2),
+    (1, 2, 1, 1), (1, 3, 2, 1), (2, 2, 2, 1), (1, 4, 2, 1),
+]
+
+#: 退化の型。後ろの 4 つは今回追加したもの
+RELU_DEGS = ("redundant", "duplicate", "dead", "zero",
+             "duplicate3", "pair", "opposite", "scaled")
+
+
+def relu_specs(*, max_params: int = 48,
+               n_data: Sequence[int] = (8, 10, 12, 16),
+               degs: Sequence[str] = RELU_DEGS,
+               seeds: Sequence[int] = (0, 1, 2, 3),
+               archs: Sequence[tuple] = tuple(RELU_ARCHS)) -> List[tuple]:
+    """(widths, degeneracy, n_data, seed) の一覧。**式は作らない**。
+
+    格子は数千件になるので、全部の記号 MLP を先に組み立てると構築だけで
+    分単位かかる。仕様だけ並べて、必要な分を case_from_spec() で作る。
+    """
+    out: List[tuple] = []
+    for widths in archs:
+        npar = sum(widths[l + 1] * widths[l] + widths[l + 1]
+                   for l in range(len(widths) - 1))
+        if npar > max_params:
+            continue
+        H = widths[1]
+        for deg in degs:
+            if deg == "duplicate3" and H < 3:
+                continue
+            if deg == "pair" and H < 4:
+                continue
+            if deg in ("duplicate", "opposite", "scaled", "dead") and H < 2:
+                continue
+            for nd in n_data:
+                for sd in seeds:
+                    out.append((tuple(widths), deg, int(nd), int(sd)))
+    return out
+
+
+def case_from_spec(spec) -> Optional[NNCase]:
+    """relu_specs() の 1 要素から NNCase を作る。"""
+    widths, deg, nd, sd = spec
+    c = mlp_case(list(widths), "relu", deg, n_data=nd, seed=sd)
+    if c is None or not c.generators:
+        return None
+    c.name = f"{c.name}/nd{nd}/s{sd}"
+    return c
+
+
+def relu_grid(*, max_params: int = 48,
+              n_data: Sequence[int] = (8, 10, 12, 16),
+              degs: Sequence[str] = RELU_DEGS,
+              seeds: Sequence[int] = (0, 1, 2, 3),
+              archs: Sequence[tuple] = tuple(RELU_ARCHS)) -> List[NNCase]:
+    """ReLU ネットの中小規模な格子。キャッシュを貯めるのに使う。
+
+    **データ点が多いほうがコアが残る**。少ないと fiber ideal の生成元が
+    すべて正則方向として消えてしまい (core = 0)、解消が走らないので
+    キャッシュに入れる値が生まれない。実測 (2-4-1 redundant) では
+    n_data = 2..6 で core = 0、n_data = 10 で core = 5 だった。
+    そのため既定の n_data は 8 以上にしてある。
+
+    実測 (n_data = 2,3,4,6,10 / seed 0 のみ / 258 件) のコア変数の分布:
+        core=0: 219, 1: 10, 2: 6, 3: 18, 4: 4, 5: 1   -> 非空は 39 件 (15%)
+    非空になるのはほぼ n_data = 10 のケースだったので、データ点を増やし
+    種も振ることで「貯める価値のあるケース」の収率を上げている。
+    """
+    out: List[NNCase] = []
+    for spec in relu_specs(max_params=max_params, n_data=n_data, degs=degs,
+                           seeds=seeds, archs=archs):
+        c = case_from_spec(spec)
+        if c is not None:
+            out.append(c)
+    return out
+
+
+# ----------------------------------------------------------------------
+# Transformer 1 層
+# ----------------------------------------------------------------------
+#: (T, d_model, d_k, d_ff, n_heads) の組
+TRANSFORMER_SHAPES = [
+    (2, 2, 2, 2, 1), (3, 2, 2, 2, 1), (2, 2, 1, 2, 1),
+    (2, 2, 2, 3, 1), (3, 2, 1, 2, 1), (2, 4, 2, 2, 2),
+]
+TRANSFORMER_DEGS = ("none", "zero_ffn", "dead_ffn", "dup_ffn",
+                    "uniform_att", "rank1_v", "dup_head")
+
+
+def transformer_specs(*, shapes=tuple(TRANSFORMER_SHAPES),
+                      degs: Sequence[str] = TRANSFORMER_DEGS,
+                      taylor: Sequence[int] = (1, 2),
+                      seeds: Sequence[int] = (0, 1)) -> List[tuple]:
+    """Transformer 1 層の仕様の一覧 (式は作らない)。"""
+    out: List[tuple] = []
+    for (T, d, dk, dff, H) in shapes:
+        for deg in degs:
+            if deg == "dup_head" and H < 2:
+                continue
+            if deg == "rank1_v" and dk < 2:
+                continue
+            for od in taylor:
+                for sd in seeds:
+                    out.append((T, d, dk, dff, H, deg, int(od), int(sd)))
+    return out
+
+
+def transformer_case_from_spec(spec) -> Optional[NNCase]:
+    """Transformer 1 層の仕様から NNCase を作る (run_case にそのまま渡せる)。"""
+    from transformer_rlct import random_layer, transformer_layer_ideal
+
+    T, d, dk, dff, H, deg, order, sd = spec
+    rng = random.Random(1000 + sd)
+    X = [[sp.Rational(rng.randint(-2, 2), 2) for _ in range(d)]
+         for _ in range(T)]
+    star = random_layer(d_model=d, d_k=dk, d_ff=dff, n_heads=H,
+                        seed=sd, degeneracy=deg)
+    ideal = transformer_layer_ideal(X, star, taylor_order=order)
+    if not ideal.generators:
+        return None
+    return NNCase(
+        name=f"transformer T{T} d{d} k{dk} ff{dff} H{H} {deg}/o{order}/s{sd}",
+        generators=ideal.generators,
+        variables=tuple(ideal.variables),
+        symmetries=ideal.symmetry_vectors,
+        activation="transformer",
+        widths=(T, d, dk, dff, H),
+        degeneracy=deg,
+        taylor_order=order,
+        n_data=T,
+    )
+
+
 def grid(max_params: int = 40) -> List[NNCase]:
     out = []
     archs = [(1, 1, 1), (1, 2, 1), (1, 3, 1), (1, 4, 1), (2, 2, 1), (2, 3, 1),
@@ -252,6 +416,40 @@ def grid(max_params: int = 40) -> List[NNCase]:
 # ----------------------------------------------------------------------
 # 実行
 # ----------------------------------------------------------------------
+def _cache_store(loc, rec) -> None:
+    """証明できたコアの値を永続キャッシュに入れる。
+
+    ニューラルネットではアーキテクチャが違っても同じコアイデアルが何度も
+    現れるので、根の値 (K, core_vars) を入れておくのが効く。部分木の値も
+    あれば一緒に入れる。**証明できたときだけ**呼ぶこと。
+    """
+    try:
+        import rlct_cache as _rc
+    except Exception:
+        return
+    if _rc.current() is None:
+        return
+    n = 0
+    try:
+        if loc.core_gens and loc.core_vars:
+            K = sp.expand(sum(g ** 2 for g in loc.core_gens))
+            if K != 0:
+                _rc.put([0] * len(loc.core_vars), [0] * len(loc.core_vars),
+                        sp.Poly(K, *loc.core_vars), tuple(loc.core_vars),
+                        loc.lam_core, loc.m_core,
+                        f"nn-core:{getattr(loc, 'core_route', '')}")
+                n += 1
+        if loc.resolution is not None:
+            for kk, hh, pp, lam_s, m_s in getattr(
+                    loc.resolution, "cache_candidates", []):
+                _rc.put(kk, hh, pp, tuple(loc.core_vars), lam_s, m_s,
+                        "nn-subtree")
+                n += 1
+    except Exception:
+        pass
+    rec["n_cache_put"] = n
+
+
 def run_case(c: NNCase, *, timeout_ms: int = 4000, max_depth: int = 8,
              timeout_s: int = 40) -> Dict:
     import signal
@@ -314,6 +512,7 @@ def run_case(c: NNCase, *, timeout_ms: int = 4000, max_depth: int = 8,
         # コアが空 (正則方向だけ) か、コア全体がニュートン非退化で厳密か
         rec["cert"] = ("newton" if rec["core_route"] == "newton"
                        else "core-empty")
+        _cache_store(loc, rec)
     else:
         try:
             from certify import certify
@@ -323,6 +522,8 @@ def run_case(c: NNCase, *, timeout_ms: int = 4000, max_depth: int = 8,
             signal.alarm(0)
             rec["status"] = cert.status
             rec["cert"] = "certify"
+            if cert.status == "proved":
+                _cache_store(loc, rec)
         except Exception as e:                        # noqa: BLE001
             signal.alarm(0)
             rec["status"] = "unknown"

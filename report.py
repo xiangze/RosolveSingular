@@ -75,6 +75,11 @@ def main():
     except Exception as e:                            # noqa: BLE001
         print(f"# 実行時間の集計に失敗: {e}")
 
+    pr = [r for r in recs if r.get("n_product")]
+    if pr:
+        print(f"# 積の分解で閉じた chart を含むケース: {len(pr)}/{n} "
+              f"(chart 合計 {sum(r['n_product'] for r in pr)})")
+
     nw = [r for r in recs if r.get("n_newton")]
     if nw:
         print(f"# ニュートン高速パスで閉じた chart を含むケース: {len(nw)}/{n}")

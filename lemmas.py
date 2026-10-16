@@ -342,16 +342,44 @@ def product_split_value(k: Sequence[int], poly: sp.Poly, h: Sequence[int],
     return result
 
 
+# ----------------------------------------------------------------------
+# 部分問題の解き手は **上の層から注入する** (依存の逆転)
+# ----------------------------------------------------------------------
+# 積の分解と挟み込みは部分問題を厳密に解く必要がある。素直に書くと
+# lemmas -> certify / resolve_singularity となり、両者がこのモジュールを
+# 呼ぶので循環する (REORG_PLAN.ja.md §3.3(a) の「機械的に移せない箇所」)。
+#
+# そこで **closer は解き手を import せず、受け取る**。既定の解き手は
+# certify.py が自分の import 時に install_subsolver() で入れる
+# (`import certify` または `import rlct` で結線される)。
+#
+# 注入されていなければ None を返して分解をあきらめる。これは **健全側に
+# 倒れる** 動作で、値が狂うことはなく「分解できる場所を見逃す」だけ。
+_SUBSOLVER = None
+
+
+def install_subsolver(fn) -> None:
+    """部分問題の厳密な (lambda, m) を返す関数を注入する。
+
+    fn(sub, vs, hh) -> (lambda, m) | None   (None を返してよい)
+    """
+    global _SUBSOLVER
+    _SUBSOLVER = fn
+
+
+def subsolver_installed() -> bool:
+    """解き手が注入されているか。"""
+    return _SUBSOLVER is not None
+
+
 def _sub_local_rlct(p, sup, k, h, gens):
     """部分問題 (y^{k|sup} * p, 振幅 y^{h|sup}) の (lambda, m) を厳密に求める。
 
-    まずニュートン非退化を試し、だめならブローアップして certify にかける。
-    証明できなければ None (呼び出し側は分解をあきらめる)。
+    まずニュートン非退化を試す (これは newton.py だけで済む)。だめなら
+    **注入された解き手**に回す。証明できなければ None。
     """
-    from certify import certify
-    from newton import newton_multiplicity, newton_nondegenerate
-    from resolve_singularity import ResolutionFailure, resolve_singularities
-    from newton import newton_rlct
+    from newton import (newton_multiplicity, newton_nondegenerate,
+                        newton_rlct)
 
     vs = tuple(sup)
     kk = [k[gens.index(v)] for v in vs]
@@ -365,16 +393,9 @@ def _sub_local_rlct(p, sup, k, h, gens):
         if lam is not sp.oo:
             m = newton_multiplicity(sub, vs, h=hh)
             return (sp.nsimplify(lam), int(m) if m else 1)
+    if _SUBSOLVER is None:
+        return None
     try:
-        # product_split=False: 部分問題の中で再び分解を試すと無限再帰になる
-        res = resolve_singularities(sub, vs, prune=False, weighted=True,
-                                    h0=hh, max_depth=12, product_split=False)
-    except ResolutionFailure:
+        return _SUBSOLVER(sub, vs, hh)
+    except Exception:            # noqa: BLE001
         return None
-    except Exception:
-        return None
-    if certify(res, timeout_ms=4000).status != "proved":
-        return None
-    if res.rlct is sp.oo:
-        return None
-    return (res.rlct, res.multiplicity)

@@ -761,7 +761,7 @@ def main() -> int:
             print(f"  {n:<36} {k:>9,}")
         return 0
 
-    from train_resnet import load_eval_batch
+    from vision_data import load_eval_batch
     X, _ = load_eval_batch(args.data, root=args.data_root, n=args.n_data,
                            size=args.size, classes=args.classes)
     params = [v for v in args.params.split(",") if v]

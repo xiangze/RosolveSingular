@@ -191,16 +191,24 @@ def resolve_fails_predicate(*, max_depth: int = 12, weighted=True,
     return pred
 
 
-def make_predicate(cls: str, *, max_depth: int = 12, timeout_ms: int = 3000):
+def make_predicate(cls: str, *, max_depth: int = 12, timeout_ms: int = 3000,
+                   run_case=None):
     """run.run_case の分類が cls と一致するかを返す述語を作る (重い)。
 
     証明側の失敗 (nc_refuted, smt_unknown など) の縮約に使う。
     解消が止まらない例には resolve_fails_predicate のほうが速い。
+
+    `run_case` は **呼び出し側から渡す** (run.run_case を想定)。ここで
+    import すると failures -> run -> failures の循環になるため
+    (REORG_PLAN.ja.md §2)、引数で受け取る形にしてある。
     """
-    import run as run_mod
+    if run_case is None:
+        raise ValueError(
+            "run_case を渡してください (例: from run import run_case)。"
+            "failures は run を import しません (循環を避けるため)。")
 
     def pred(f, gens):
-        rec = run_mod.run_case("probe", f, tuple(gens), "probe",
+        rec = run_case("probe", f, tuple(gens), "probe",
                                max_depth=max_depth, timeout_ms=timeout_ms)
         return rec["class"] == cls
 

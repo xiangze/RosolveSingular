@@ -989,6 +989,40 @@ def _rlct_certified_inner(f, gens, *, timeout_ms, max_depth, verbose,
 # ----------------------------------------------------------------------
 # デモ
 # ----------------------------------------------------------------------
+# closer への結線 (依存の逆転)
+# ----------------------------------------------------------------------
+def _default_subsolver(sub, vs, hh):
+    """`lemmas` の積分解・挟み込みが使う部分問題の解き手。
+
+    lemmas 側はこれを import しない (循環になる)。**こちらから注入する**
+    ことで、依存の向きを closer -> 判定器 から 判定器 -> closer の
+    一方向に揃えている (REORG_PLAN.ja.md §3.3(a))。
+    """
+    from resolve_singularity import ResolutionFailure, resolve_singularities
+    try:
+        # product_split=False: 部分問題の中で再び分解を試すと無限再帰になる
+        res = resolve_singularities(sub, vs, prune=False, weighted=True,
+                                    h0=list(hh), max_depth=12,
+                                    product_split=False)
+    except ResolutionFailure:
+        return None
+    except Exception:                             # noqa: BLE001
+        return None
+    if certify(res, timeout_ms=4000).status != "proved":
+        return None
+    if res.rlct is sp.oo:
+        return None
+    return (res.rlct, res.multiplicity)
+
+
+try:
+    import lemmas as _lemmas
+    _lemmas.install_subsolver(_default_subsolver)
+except Exception:                                 # pragma: no cover
+    pass
+
+
+# ----------------------------------------------------------------------
 def _demo():
     from resolve_singularity import resolve_singularities
 

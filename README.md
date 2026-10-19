@@ -76,6 +76,28 @@ timing, newton          -> families, invariants, rlct_cache
                         -> torch_rlct, resnet_rlct, transformer_rlct -> exp, bench
 ```
 
+## パラメータ掃引
+
+`exp/cnn_sweep.py` と `exp/taylor_sweep.py` は層数・活性化・テイラー次数を
+リストで受け取りますが、**形状はスカラー**です。形状も振る場合は
+`exp/shape_sweep.py` を外側から回します。
+
+```sh
+python -m exp.shape_sweep --list                      # 格子の一覧と最悪時間の見積り
+python -m exp.shape_sweep --grid cnn-small --dry-run  # 計画だけ (計算しない)
+python -m exp.shape_sweep --grid cnn-small --out runs/cnn.jsonl
+python -m exp.shape_sweep --report runs/cnn.jsonl --csv runs/cnn.csv
+```
+
+* 形状の組ごとに子プロセスで内側の掃引を起動します。内側もさらに次数ごとに
+  プロセスを分けているので、1 つ固まっても掃引は進みます。
+* **再開できます。**同じコマンドを再実行すると、揃っている形状は飛ばします
+  (揃っていない形状はやり直し)。
+* **タイムアウトと失敗を落としません。**`status` が `ok` / `timeout` /
+  `error` のいずれかで必ず記録されます。λ が出なかったこともデータです。
+* `-- ` の後ろの引数は内側の掃引にそのまま渡ります
+  (例: `-- --orders 0,1` で次数を絞る)。
+
 ## 回帰テスト
 
 **リポジトリの根から**実行します (パッケージなので `-m` を使う)。
